@@ -79,9 +79,16 @@ cargo check -p ovt-desktop  # host compile (Windows verified locally; macOS in C
 cd apps/desktop && npm run build   # tsc + vite production build
 ```
 
+## Releases
+
+Update the version in `Cargo.toml`, `apps/desktop/package.json`, and `apps/desktop/src-tauri/tauri.conf.json`, then push a matching `vX.Y.Z` tag. The release workflow builds Windows x64 and macOS Universal installers, signs the updater artifacts, and uploads them to a draft GitHub Release with `latest.json`.
+
+Publish the draft release manually after checking both installers. The in-app updater then reads `https://github.com/sileneer/oh-my-voice-type/releases/latest/download/latest.json`. The repository must keep the `TAURI_SIGNING_PRIVATE_KEY` Actions secret configured, and the private key must be backed up separately.
+
 ## Status / known limits (v1)
 
 - Dictate mode end-to-end. Translate + Edit Selection prompts exist in core; UI wiring is next.
 - Insertion: clipboard + synthetic paste with clipboard restore; AX (macOS)/UIA (Windows) direct insertion and opt-in caret context are milestone 2.
 - Wayland/Linux and mobile hosts are phase 2/3 (the core crate is already host-agnostic).
-- Not yet: tray icon menu, updater packaging, crash-safe pending queue (see plan milestones M4–M6).
+- Windows code signing and macOS notarization are not configured yet; updater artifacts are signed separately.
+- Crash-safe pending queue is still pending (see plan milestones M4–M6).

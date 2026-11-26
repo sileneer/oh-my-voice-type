@@ -21,10 +21,14 @@ pub fn run() {
         )
         .init();
 
+    let updater = tauri_plugin_updater::Builder::new();
+    #[cfg(target_os = "macos")]
+    let updater = updater.target("darwin-universal");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(updater.build())
         .setup(|app| {
             use tauri_plugin_dialog::DialogExt;
             let handle = app.handle().clone();

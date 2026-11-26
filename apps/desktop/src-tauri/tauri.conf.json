@@ -40,11 +40,15 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": ""
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgxQzBDMjk1Q0NENjhCMDIKUldRQ2k5Yk1sY0xBZ2FBWDI0Zmt3bHRyRFY3S2ZDS2hCM3VxdDlhMSt3MTVVTjNKSXF4bUYwUXUK",
+      "endpoints": [
+        "https://github.com/sileneer/oh-my-voice-type/releases/latest/download/latest.json"
+      ]
     }
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

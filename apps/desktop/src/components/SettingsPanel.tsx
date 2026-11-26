@@ -265,6 +265,7 @@ function eventsSubscribe(callback: (snapshot: UpdaterSnapshot) => void) {
 function updateMessage(snapshot: UpdaterSnapshot | null, t: TFunc) {
   switch (snapshot?.status ?? "unconfigured") {
     case "unconfigured": return t("settings.updateUnconfigured");
+    case "idle": return t("settings.updateIdle");
     case "checking": return t("settings.updateChecking");
     case "available": return t("settings.updateAvailable", { version: snapshot?.update?.version ?? "" });
     case "downloading": return t("settings.updateChecking");

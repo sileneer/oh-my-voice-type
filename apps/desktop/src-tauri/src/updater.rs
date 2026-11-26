@@ -42,11 +42,11 @@ fn state() -> &'static Mutex<UpdaterSnapshot> {
     static STATE: OnceLock<Mutex<UpdaterSnapshot>> = OnceLock::new();
     STATE.get_or_init(|| {
         Mutex::new(UpdaterSnapshot {
-            status: UpdaterStatus::Unconfigured,
+            status: UpdaterStatus::Idle,
             current_version: env!("CARGO_PKG_VERSION").to_string(),
             update: None,
             progress: None,
-            message: Some("Update service is not configured.".to_string()),
+            message: None,
         })
     })
 }
@@ -68,28 +68,7 @@ fn publish(app: &AppHandle, snapshot: UpdaterSnapshot) {
     let _ = app.emit("updater:changed", &snapshot);
 }
 
-fn configured() -> Option<(String, String)> {
-    let endpoint = std::env::var("OVT_UPDATER_ENDPOINT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())?;
-    let public_key = std::env::var("OVT_UPDATER_PUBKEY")
-        .ok()
-        .filter(|value| !value.trim().is_empty())?;
-    Some((endpoint, public_key))
-}
-
 pub async fn check(app: &AppHandle) -> UpdaterSnapshot {
-    let Some((endpoint, public_key)) = configured() else {
-        let snapshot = UpdaterSnapshot {
-            status: UpdaterStatus::Unconfigured,
-            current_version: env!("CARGO_PKG_VERSION").to_string(),
-            update: None,
-            progress: None,
-            message: Some("Update service is not configured.".to_string()),
-        };
-        publish(app, snapshot.clone());
-        return snapshot;
-    };
     publish(
         app,
         UpdaterSnapshot {
@@ -101,13 +80,8 @@ pub async fn check(app: &AppHandle) -> UpdaterSnapshot {
         },
     );
     let result = async {
-        let url = reqwest::Url::parse(&endpoint)
-            .map_err(|error| format!("invalid update endpoint: {error}"))?;
         let updater = app
             .updater_builder()
-            .endpoints(vec![url])
-            .map_err(|error| error.to_string())?
-            .pubkey(public_key)
             .build()
             .map_err(|error| error.to_string())?;
         updater.check().await.map_err(|error| error.to_string())
