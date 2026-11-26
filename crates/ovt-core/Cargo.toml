@@ -1,0 +1,19 @@
+[package]
+name = "ovt-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }
+tracing = "0.1"
+async-trait = "0.1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,24 @@
+# Target
+node_modules/
+dist/
+*.local
+.env
+.env.*
+
+# Rust
+target/
+Cargo.lock.bak
+
+# Local toolchain bootstrap
+.tools/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# App runtime artifacts
+*.log
+apps/desktop/src-tauri/gen/

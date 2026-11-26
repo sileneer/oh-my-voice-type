@@ -1,0 +1,51 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy -p ovt-core -- -D warnings
+      - run: cargo test -p ovt-core
+
+  desktop-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: frontend
+        working-directory: apps/desktop
+        run: |
+          npm install --no-fund --no-audit
+          npx tsc --noEmit
+          npm run build
+      - name: host
+        run: cargo check -p ovt-desktop
+
+  desktop-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: frontend
+        working-directory: apps/desktop
+        run: |
+          npm install --no-fund --no-audit
+          npx tsc --noEmit
+          npm run build
+      - name: host
+        run: cargo check -p ovt-desktop

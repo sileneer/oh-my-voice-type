@@ -1,0 +1,70 @@
+[package]
+name = "ovt-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "oh-my-voice-type desktop app (macOS + Windows)"
+
+[lib]
+name = "ovt_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+ovt-core = { path = "../../../crates/ovt-core" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+cpal = "0.15"
+arboard = "3"
+dirs = "6"
+reqwest = { version = "0.12", default-features = false }
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+tauri-plugin-updater = "2.14.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
+  "Win32_Graphics_Gdi",
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_UI_Accessibility",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSAutoreleasePool"] }
+objc2-app-kit = { version = "0.3", features = [
+  "NSPasteboard",
+  "NSEvent",
+  "NSApplication",
+  "NSWorkspace",
+  "NSScreen",
+] }
+core-foundation = "0.10"
+core-graphics = "0.24"
+objc2-core-foundation = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,158 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { toast, Toaster } from "sonner";
+import { api, events, missingProfileStatus, type ApiStatus, type Mode, type SessionState, type Settings } from "./lib/api";
+import { useTheme, normalizeThemePreference } from "./lib/theme";
+import { makeT, resolveLocale } from "./i18n";
+import { AppShell } from "./components/app/AppShell";
+import { HomePage } from "./components/home/HomePage";
+import HistoryList from "./components/HistoryList";
+import SettingsPanel from "./components/SettingsPanel";
+import Onboarding from "./components/Onboarding";
+import { Skeleton } from "./components/ui/skeleton";
+import { Button } from "./components/ui/button";
+
+export type { ApiStatus, SessionState } from "./lib/api";
+type Tab = "home" | "history" | "settings";
+
+export default function App() {
+  const [tab, setTab] = useState<Tab>("home");
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [permissions, setPermissions] = useState<Record<string, string>>({});
+  const [apiStatus, setApiStatus] = useState<ApiStatus>(missingProfileStatus);
+  const [session, setSession] = useState<SessionState>("idle");
+  const [level, setLevel] = useState(0);
+  const [mode, setMode] = useState<Mode>("dictate");
+  const [targetLanguage, setTargetLanguage] = useState("English");
+  const [pendingCount, setPendingCount] = useState(0);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [onboardingDismissed, setOnboardingDismissed] = useState(false);
+  const activeSessionId = useRef<string | null>(null);
+
+  useTheme(settings?.ui.theme);
+
+  const refreshSettings = useCallback(async () => {
+    const next = await api.getSettings();
+    setSettings(next);
+    setMode(next.dictation.default_mode ?? "dictate");
+    setTargetLanguage(next.dictation.translate_target || "English");
+  }, []);
+  const refreshStatus = useCallback(async () => {
+    try { setApiStatus(await api.apiStatus()); } catch { setApiStatus(missingProfileStatus()); }
+  }, []);
+  const refreshPending = useCallback(async () => {
+    try { setPendingCount((await api.pendingList()).length); } catch { setPendingCount(0); }
+  }, []);
+  const refreshPermissions = useCallback(async () => {
+    try { setPermissions(await api.permissionStatus()); } catch { setPermissions({}); }
+  }, []);
+
+  const navigate = useCallback((next: Tab) => {
+    setTab(next);
+    window.requestAnimationFrame(() => document.querySelector<HTMLElement>("h1")?.focus());
+  }, []);
+
+  useEffect(() => {
+    void refreshSettings().catch((cause) => setLoadError(String(cause)));
+    void refreshStatus();
+    void refreshPending();
+    void refreshPermissions();
+  }, [refreshPending, refreshPermissions, refreshSettings, refreshStatus]);
+
+  useEffect(() => {
+    const unlisteners: Array<() => void> = [];
+    void events.onSessionWarning((message) => toast.warning(message)).then((u) => unlisteners.push(u));
+    void events.onSessionError((message) => toast.error(message)).then((u) => unlisteners.push(u));
+    void events.onSettingsChanged((next) => {
+      setSettings(next);
+      setMode(next.dictation.default_mode ?? "dictate");
+      setTargetLanguage(next.dictation.translate_target || "English");
+    }).then((u) => unlisteners.push(u));
+    void events.onSessionState((event) => {
+      if (event.session_id) {
+        if (event.state === "starting") activeSessionId.current = event.session_id;
+        else if (activeSessionId.current && event.session_id !== activeSessionId.current) return;
+      }
+      const valid: SessionState[] = ["idle", "starting", "recording", "processing", "cancelling", "error"];
+      setSession(valid.includes(event.state as SessionState) ? event.state as SessionState : "idle");
+      if (event.state === "error" && event.message) toast.error(event.message);
+      if (event.state === "idle") { activeSessionId.current = null; setLevel(0); void refreshPending(); }
+    }).then((u) => unlisteners.push(u));
+    void events.onSessionLevel((value) => setLevel(value)).then((u) => unlisteners.push(u));
+    void events.onSessionOutcome(() => { activeSessionId.current = null; setLevel(0); void refreshPending(); }).then((u) => unlisteners.push(u));
+    void events.onPendingChanged(() => void refreshPending()).then((u) => unlisteners.push(u));
+    void events.onAppNavigate(({ tab: next }) => {
+      if (next === "home" || next === "history" || next === "settings") navigate(next);
+    }).then((u) => unlisteners.push(u));
+    return () => unlisteners.forEach((u) => u());
+  }, [navigate, refreshPending]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const editing = target instanceof HTMLElement && target.matches("input, textarea, select, [contenteditable='true']");
+      if ((event.ctrlKey || event.metaKey) && event.key === ",") { event.preventDefault(); navigate("settings"); return; }
+      if (editing || event.ctrlKey || event.metaKey) return;
+      if (event.altKey && event.key === "1") { event.preventDefault(); navigate("home"); }
+      if (event.altKey && event.key === "2") { event.preventDefault(); navigate("history"); }
+      if (event.altKey && event.key === "3") { event.preventDefault(); navigate("settings"); }
+      if (!event.altKey && event.key === "/" && tab === "history") { event.preventDefault(); document.querySelector<HTMLInputElement>("input[placeholder]")?.focus(); }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [navigate, tab]);
+
+  const saveSettings = useCallback(async (next: Settings) => {
+    const saved = await api.setSettings(next);
+    setSettings(saved);
+    setMode(saved.dictation.default_mode ?? "dictate");
+    setTargetLanguage(saved.dictation.translate_target || "English");
+    await refreshStatus();
+  }, [refreshStatus]);
+
+  const startSession = useCallback(async () => {
+    try {
+      const handle = await api.sessionStart({ mode, target_language: mode === "translate" ? targetLanguage : null, source: "ui" });
+      activeSessionId.current = handle.session_id;
+    } catch (cause) { toast.error(String(cause)); }
+  }, [mode, targetLanguage]);
+  const cancelSession = useCallback(async () => {
+    try { await api.cancel(); } catch (cause) { toast.error(String(cause)); }
+  }, []);
+
+  if (loadError) {
+    const t = makeT(resolveLocale("auto"));
+    return <div className="flex h-full flex-col items-center justify-center gap-4 p-8 text-center"><p className="max-w-lg text-sm text-destructive" role="alert">{loadError}</p><Button type="button" onClick={() => { setLoadError(null); void refreshSettings().catch((cause) => setLoadError(String(cause))); }}>{t("common.retry")}</Button></div>;
+  }
+  if (!settings) {
+    return <div className="flex h-full items-center justify-center"><Skeleton className="h-48 w-80 max-w-[80vw]" /></div>;
+  }
+
+  const locale = resolveLocale(settings.ui.locale);
+  const t = makeT(locale);
+  const showOnboarding = settings.ui.onboarding_completed === false && !onboardingDismissed;
+
+  return (
+    <>
+      {showOnboarding ? (
+        <Onboarding
+          settings={settings}
+          permissions={permissions}
+          apiStatus={apiStatus}
+          locale={locale}
+          t={t}
+          onOpenSettings={() => { setOnboardingDismissed(true); navigate("settings"); }}
+          onRefreshPermissions={() => void refreshPermissions()}
+          onSave={saveSettings}
+          onFinish={() => setOnboardingDismissed(true)}
+        />
+      ) : (
+        <AppShell tab={tab} apiStatus={apiStatus} pendingCount={pendingCount} t={t} onNavigate={navigate}>
+          {tab === "home" && <HomePage settings={settings} apiStatus={apiStatus} permissions={permissions} session={session} mode={mode} targetLanguage={targetLanguage} level={level} pendingCount={pendingCount} locale={locale} t={t} onOpenSettings={() => navigate("settings")} onOpenHistory={() => navigate("history")} onModeChange={setMode} onTargetChange={setTargetLanguage} onStart={() => void startSession()} onCancel={() => void cancelSession()} onSave={saveSettings} onRefreshPermissions={refreshPermissions} onError={(message) => toast.error(message)} />}
+          {tab === "history" && <HistoryList locale={locale} t={t} />}
+          {tab === "settings" && <SettingsPanel settings={settings} apiStatus={apiStatus} t={t} locale={locale} onSave={saveSettings} onError={(message) => toast.error(message)} onChanged={refreshSettings} onApiStatusChanged={refreshStatus} />}
+        </AppShell>
+      )}
+      <Toaster theme={normalizeThemePreference(settings.ui.theme)} position="bottom-right" richColors closeButton />
+    </>
+  );
+}

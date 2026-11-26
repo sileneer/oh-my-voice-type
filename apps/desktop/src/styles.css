@@ -1,0 +1,161 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --canvas: 248 250 252;
+  --surface: 255 255 255;
+  --surface-sunken: 248 250 252;
+  --surface-muted: 241 245 249;
+  --ink: 15 23 42;
+  --text-body: 30 41 59;
+  --text-secondary: 51 65 85;
+  --text-muted: 71 85 105;
+  --text-faint: 148 163 184;
+  --line: 226 232 240;
+  --line-strong: 203 213 225;
+  --line-hover: 148 163 184;
+  --accent: 16 185 129;
+  --accent-hover: 52 211 153;
+  --accent-ink: 2 44 34;
+  --success: 4 120 87;
+  --warning: 180 83 9;
+  --warning-strong: 251 191 36;
+  --warning-hover: 252 211 77;
+  --warning-ink: 69 26 3;
+  --danger: 190 24 93;
+  --background: var(--canvas);
+  --foreground: var(--ink);
+  --card: var(--surface);
+  --card-foreground: var(--ink);
+  --popover: var(--surface);
+  --popover-foreground: var(--ink);
+  --primary: var(--accent);
+  --primary-foreground: var(--accent-ink);
+  --secondary: var(--surface-muted);
+  --secondary-foreground: var(--ink);
+  --muted: var(--surface-muted);
+  --muted-foreground: var(--text-muted);
+  --accent-soft: var(--surface-muted);
+  --accent-foreground: var(--ink);
+  --destructive: var(--danger);
+  --destructive-foreground: var(--canvas);
+  --border: var(--line);
+  --input: var(--line-strong);
+  --ring: var(--accent);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --canvas: 7 11 20;
+  --surface: 15 23 42;
+  --surface-sunken: 2 6 23;
+  --surface-muted: 30 41 59;
+  --ink: 241 245 249;
+  --text-body: 226 232 240;
+  --text-secondary: 203 213 225;
+  --text-muted: 148 163 184;
+  --text-faint: 71 85 105;
+  --line: 30 41 59;
+  --line-strong: 51 65 85;
+  --line-hover: 100 116 139;
+  --accent: 16 185 129;
+  --accent-hover: 52 211 153;
+  --accent-ink: 2 44 34;
+  --success: 110 231 183;
+  --warning: 252 211 77;
+  --warning-strong: 251 191 36;
+  --warning-hover: 252 211 77;
+  --warning-ink: 69 26 3;
+  --danger: 253 164 175;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+    --canvas: 7 11 20;
+    --surface: 15 23 42;
+    --surface-sunken: 2 6 23;
+    --surface-muted: 30 41 59;
+    --ink: 241 245 249;
+    --body: 226 232 240;
+    --secondary: 203 213 225;
+    --muted: 148 163 184;
+    --faint: 71 85 105;
+    --line: 30 41 59;
+    --line-strong: 51 65 85;
+    --line-hover: 100 116 139;
+    --accent: 16 185 129;
+    --accent-hover: 52 211 153;
+    --accent-ink: 2 44 34;
+    --success: 110 231 183;
+    --warning: 252 211 77;
+    --warning-strong: 251 191 36;
+    --warning-hover: 252 211 77;
+    --warning-ink: 69 26 3;
+    --danger: 253 164 175;
+  }
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply antialiased bg-background text-foreground;
+    font-family:
+      -apple-system,
+      BlinkMacSystemFont,
+      "Segoe UI",
+      "PingFang SC",
+      "Microsoft YaHei",
+      "Noto Sans SC",
+      sans-serif;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html[data-view="pill"],
+  html[data-view="pill"] body,
+  html[data-view="pill"] #root {
+    background: transparent;
+  }
+
+  ::selection {
+    background: rgb(var(--accent) / 0.3);
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--line-strong)) transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background: rgb(var(--line-strong));
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
