@@ -54,14 +54,11 @@ pub fn foreground_work_area() -> Option<(i32, i32, i32, i32)> {
 // Permissions
 // ---------------------------------------------------------------------------
 
-extern "C" {
-    fn AXIsProcessTrusted() -> bool;
-}
-
 type AXUIElementRef = *mut std::ffi::c_void;
 
-#[link(name = "ApplicationServices")]
+#[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
+    fn AXIsProcessTrusted() -> bool;
     fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
     fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,
