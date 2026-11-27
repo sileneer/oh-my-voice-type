@@ -258,9 +258,12 @@ pub fn start_from_own_ui(
 
 /// Whether dictated `text` needs a space after the existing text before the
 /// caret: only between Latin-script words (or sentence punctuation and a
-/// word). CJK text, existing whitespace and empty fields never get one.
+/// word). CJK text, existing whitespace, opening quotes and empty fields
+/// never get one. `before` needs the last two characters so a straight
+/// quote can be told apart: `said "` opens, `"done."` closes.
 fn needs_leading_space(before: &str, text: &str) -> bool {
-    let (Some(prev), Some(first)) = (before.chars().last(), text.chars().next()) else {
+    let mut previous = before.chars().rev();
+    let (Some(prev), Some(first)) = (previous.next(), text.chars().next()) else {
         return false;
     };
     let is_cjk = |c: char| {
@@ -268,11 +271,16 @@ fn needs_leading_space(before: &str, text: &str) -> bool {
             0x2E80..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x2FFFF)
     };
     let latin_word = |c: char| c.is_alphanumeric() && !is_cjk(c);
-    let prev_joins = latin_word(prev)
-        || matches!(
-            prev,
-            '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"' | '\''
-        );
+    let ends_phrase = |c: char| {
+        latin_word(c)
+            || matches!(
+                c,
+                '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '\u{201D}' | '\u{2019}'
+            )
+    };
+    // A straight quote closes only when it follows a word or punctuation.
+    let prev_joins = ends_phrase(prev)
+        || (matches!(prev, '"' | '\'') && previous.next().is_some_and(ends_phrase));
     prev_joins && latin_word(first)
 }
 
@@ -543,7 +551,7 @@ async fn run_session_inner(
         } else {
             // Consecutive dictations ran together ("estossecond test."):
             // separate them from preceding Latin text, as typing would.
-            let before = state.inserters.context.text_before_caret(1);
+            let before = state.inserters.context.text_before_caret(2);
             if before.is_some_and(|before| needs_leading_space(&before, text)) {
                 state.inserters.inserter.insert(&format!(" {text}"))
             } else {
@@ -1435,6 +1443,19 @@ mod tests {
         assert!(!needs_leading_space("Hello", "，然后"));
         assert!(!needs_leading_space("你好。", "Next"));
         assert!(!needs_leading_space("(", "note"));
+    }
+
+    #[test]
+    fn opening_quotes_get_no_space_but_closing_quotes_do() {
+        assert!(!needs_leading_space("He said \"", "hello"));
+        assert!(!needs_leading_space("\"", "hello"));
+        assert!(!needs_leading_space("it's '", "quoted"));
+        assert!(!needs_leading_space("(\"", "aside"));
+        assert!(!needs_leading_space("你好\"", "Next"));
+        assert!(!needs_leading_space("He said \u{201C}", "hello"));
+        assert!(needs_leading_space("\"done.\"", "Next"));
+        assert!(needs_leading_space("the 'word'", "next"));
+        assert!(needs_leading_space("\u{201C}done\u{201D}", "Next"));
     }
 
     #[test]
