@@ -140,11 +140,18 @@ pub fn start(app: &AppHandle, request: SessionRequest) -> ovt_core::Result<Sessi
     };
     let providers =
         build_session_providers(&settings, request.mode).map_err(ovt_core::Error::Config)?;
-    let target = if request.mode == SessionMode::EditSelection {
+    let mut target = if request.mode == SessionMode::EditSelection {
         state.inserters.context.capture_selection()?
     } else {
         state.inserters.context.capture()?
     };
+    // The "text near the caret" setting was a no-op: nothing ever read it.
+    if request.mode != SessionMode::EditSelection && settings.context.include_caret_context {
+        target.caret_text = state
+            .inserters
+            .context
+            .text_before_caret(settings.context.max_caret_chars);
+    }
     if platform::is_own_target(&target) {
         return Err(ovt_core::Error::Insert(
             "focus the destination app before starting a session; text is never inserted into oh-my-voice-type itself"
@@ -247,6 +254,26 @@ pub fn start_from_own_ui(
     let result = start(app, request);
     tracing::info!(ok = result.is_ok(), "own-UI start finished");
     result
+}
+
+/// Whether dictated `text` needs a space after the existing text before the
+/// caret: only between Latin-script words (or sentence punctuation and a
+/// word). CJK text, existing whitespace and empty fields never get one.
+fn needs_leading_space(before: &str, text: &str) -> bool {
+    let (Some(prev), Some(first)) = (before.chars().last(), text.chars().next()) else {
+        return false;
+    };
+    let is_cjk = |c: char| {
+        matches!(c as u32,
+            0x2E80..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x2FFFF)
+    };
+    let latin_word = |c: char| c.is_alphanumeric() && !is_cjk(c);
+    let prev_joins = latin_word(prev)
+        || matches!(
+            prev,
+            '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"' | '\''
+        );
+    prev_joins && latin_word(first)
 }
 
 fn validate_edit_target(target: &TargetInfo) -> ovt_core::Result<()> {
@@ -514,7 +541,14 @@ async fn run_session_inner(
                 .context
                 .replace_selection(&expected_target, text)
         } else {
-            state.inserters.inserter.insert(text)
+            // Consecutive dictations ran together ("estossecond test."):
+            // separate them from preceding Latin text, as typing would.
+            let before = state.inserters.context.text_before_caret(1);
+            if before.is_some_and(|before| needs_leading_space(&before, text)) {
+                state.inserters.inserter.insert(&format!(" {text}"))
+            } else {
+                state.inserters.inserter.insert(text)
+            }
         }
     };
     pending.transition(
@@ -1270,11 +1304,7 @@ pub async fn retry_pending(app: &AppHandle, id: String) -> ovt_core::Result<Pend
     };
     let result = if task.raw_text.is_empty() {
         engine
-            .process(input, |_| {
-                Err(ovt_core::Error::Insert(
-                    "recovery never auto-inserts".into(),
-                ))
-            })
+            .process(input, |_| Err(ovt_core::Error::DeliverySkipped))
             .await
     } else {
         engine
@@ -1282,11 +1312,7 @@ pub async fn retry_pending(app: &AppHandle, id: String) -> ovt_core::Result<Pend
                 uuid::Uuid::new_v4().to_string(),
                 task.raw_text.clone(),
                 input,
-                |_| {
-                    Err(ovt_core::Error::Insert(
-                        "recovery never auto-inserts".into(),
-                    ))
-                },
+                |_| Err(ovt_core::Error::DeliverySkipped),
             )
             .await
     };
@@ -1382,9 +1408,7 @@ pub async fn reprocess_history(
     };
     let outcome = engine
         .rewrite_raw(new_id, entry.raw_text.clone(), input, |_| {
-            Err(ovt_core::Error::Insert(
-                "reprocessing never auto-inserts".into(),
-            ))
+            Err(ovt_core::Error::DeliverySkipped)
         })
         .await?;
     history.set_delivery(&outcome.id, "needs_review")?;
@@ -1400,6 +1424,18 @@ fn update_tray(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consecutive_latin_dictations_are_separated_but_cjk_is_not() {
+        assert!(needs_leading_space("estos", "second test."));
+        assert!(needs_leading_space("Done.", "Next point"));
+        assert!(!needs_leading_space("estos ", "second"));
+        assert!(!needs_leading_space("", "Hello"));
+        assert!(!needs_leading_space("今天开会", "我们"));
+        assert!(!needs_leading_space("Hello", "，然后"));
+        assert!(!needs_leading_space("你好。", "Next"));
+        assert!(!needs_leading_space("(", "note"));
+    }
 
     #[test]
     fn hotkey_ownership_is_per_mode_and_ignores_finished_sessions() {

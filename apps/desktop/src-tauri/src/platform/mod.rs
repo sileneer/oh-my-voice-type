@@ -64,6 +64,12 @@ pub trait ContextProvider: Send + Sync + 'static {
         }
         Ok(current)
     }
+    /// Up to `max_chars` characters immediately before the caret in the
+    /// focused field, when the platform can read them (never for password
+    /// fields). `None` = unknown.
+    fn text_before_caret(&self, _max_chars: usize) -> Option<String> {
+        None
+    }
     fn replace_selection(&self, _expected: &TargetInfo, _text: &str) -> Result<()> {
         Err(ovt_core::Error::Unsupported(
             "selection replacement is not implemented on this platform".into(),

@@ -24,6 +24,10 @@ pub enum Error {
     Timeout(String),
     #[error("operation cancelled")]
     Cancelled,
+    /// The caller deliberately does not deliver this result (recovery and
+    /// reprocessing never auto-insert). Not a failure, so no warning.
+    #[error("delivery skipped")]
+    DeliverySkipped,
 }
 
 impl From<rusqlite::Error> for Error {

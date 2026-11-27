@@ -408,6 +408,28 @@ fn recovered_native_rate_audio_is_normalised_to_16k() {
 }
 
 #[tokio::test]
+async fn skipped_delivery_is_not_reported_as_a_failure() {
+    // Recovery and reprocessing never auto-insert; their history entries must
+    // not carry a "Could not insert text" warning for that.
+    let asr = mock_asr("hello there");
+    let llm = Arc::new(MockLlm {
+        reply: Ok("Hello there.".into()),
+        calls: AtomicUsize::new(0),
+        cleanup: Mutex::new(None),
+    });
+    let e = engine(asr, llm, None);
+    let outcome = e
+        .process(DictationInput::new(speech_wav(), Mode::Dictate), |_| {
+            Err(ovt_core::Error::DeliverySkipped)
+        })
+        .await
+        .unwrap();
+    assert!(!outcome.inserted);
+    assert_eq!(outcome.final_text, "Hello there.");
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+}
+
+#[tokio::test]
 async fn insert_failure_reports_not_inserted() {
     let asr = mock_asr("hi");
     let llm = Arc::new(MockLlm {

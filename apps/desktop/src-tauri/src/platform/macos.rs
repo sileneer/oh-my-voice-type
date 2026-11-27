@@ -15,7 +15,7 @@ use std::sync::mpsc::sync_channel;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
+use core_foundation::base::{CFIndex, CFRange, CFRelease, CFTypeRef, TCFType};
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::event::{
@@ -77,7 +77,18 @@ extern "C" {
         attribute: CFStringRef,
         value: CFTypeRef,
     ) -> i32;
+    fn AXUIElementCopyParameterizedAttributeValue(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        parameter: CFTypeRef,
+        value: *mut CFTypeRef,
+    ) -> i32;
+    fn AXValueGetValue(value: CFTypeRef, value_type: u32, out: *mut std::ffi::c_void) -> bool;
+    fn AXValueCreate(value_type: u32, value: *const std::ffi::c_void) -> CFTypeRef;
 }
+
+/// `kAXValueCFRangeType`.
+const AX_VALUE_CF_RANGE: u32 = 4;
 
 pub fn accessibility_trusted() -> bool {
     unsafe { AXIsProcessTrusted() }
@@ -241,6 +252,28 @@ impl ContextProvider for MacContext {
         Ok(info)
     }
 
+    fn text_before_caret(&self, max_chars: usize) -> Option<String> {
+        if max_chars == 0 || !accessibility_trusted() {
+            return None;
+        }
+        let pid = i32::try_from(self.target().process_id?).ok()?;
+        unsafe {
+            let application = AXUIElementCreateApplication(pid);
+            if application.is_null() {
+                return None;
+            }
+            let focused = focused_element(application);
+            CFRelease(application as CFTypeRef);
+            let focused = focused.ok()?;
+            if focused.is_null() {
+                return None;
+            }
+            let text = caret_prefix(focused, max_chars);
+            CFRelease(focused as CFTypeRef);
+            text
+        }
+    }
+
     fn replace_selection(&self, expected: &TargetInfo, text: &str) -> Result<()> {
         let current = self.capture_selection()?;
         if current.stable_target_id != expected.stable_target_id
@@ -300,6 +333,63 @@ unsafe fn focused_element(application: AXUIElementRef) -> Result<AXUIElementRef>
         )));
     }
     Ok(value as AXUIElementRef)
+}
+
+/// Up to `max_chars` characters before the caret of `element`, via
+/// `AXSelectedTextRange` + `AXStringForRange`; `None` for secure fields.
+unsafe fn caret_prefix(element: AXUIElementRef, max_chars: usize) -> Option<String> {
+    let role = ax_string(element, "AXRole").unwrap_or_default();
+    let subrole = ax_string(element, "AXSubrole").unwrap_or_default();
+    if role.contains("Secure") || subrole.contains("Secure") {
+        return None;
+    }
+    let attribute = CFString::new("AXSelectedTextRange");
+    let mut value: CFTypeRef = std::ptr::null();
+    if AXUIElementCopyAttributeValue(element, attribute.as_concrete_TypeRef(), &mut value) != 0
+        || value.is_null()
+    {
+        return None;
+    }
+    let mut selected = CFRange {
+        location: 0,
+        length: 0,
+    };
+    let read = AXValueGetValue(
+        value,
+        AX_VALUE_CF_RANGE,
+        &mut selected as *mut CFRange as *mut std::ffi::c_void,
+    );
+    CFRelease(value);
+    if !read || selected.location <= 0 {
+        return None;
+    }
+    let count = (max_chars as CFIndex).min(selected.location);
+    let wanted = CFRange {
+        location: selected.location - count,
+        length: count,
+    };
+    let parameter = AXValueCreate(
+        AX_VALUE_CF_RANGE,
+        &wanted as *const CFRange as *const std::ffi::c_void,
+    );
+    if parameter.is_null() {
+        return None;
+    }
+    let name = CFString::new("AXStringForRange");
+    let mut text: CFTypeRef = std::ptr::null();
+    let status = AXUIElementCopyParameterizedAttributeValue(
+        element,
+        name.as_concrete_TypeRef(),
+        parameter,
+        &mut text,
+    );
+    CFRelease(parameter);
+    if status != 0 || text.is_null() {
+        return None;
+    }
+    let string = CFString::wrap_under_get_rule(text as CFStringRef).to_string();
+    CFRelease(text);
+    Some(string)
 }
 
 unsafe fn ax_string(element: AXUIElementRef, name: &str) -> Option<String> {

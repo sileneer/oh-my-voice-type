@@ -316,7 +316,7 @@ impl DictationEngine {
                     Err(error) => {
                         warn!(error = %error, "dictation cleanup failed; using raw transcript");
                         warnings.push(format!(
-                            "AI cleanup unavailable ({error}); inserted raw transcript"
+                            "AI cleanup unavailable ({error}); used the raw transcript"
                         ));
                         raw_text.clone()
                     }
@@ -324,7 +324,7 @@ impl DictationEngine {
             }
             None if input.mode == Mode::Dictate && self.settings.dictation.cleanup_enabled => {
                 warnings.push(
-                    "AI cleanup is off (no cleanup provider available) — inserted the raw transcript."
+                    "AI cleanup is off (no cleanup provider available) — used the raw transcript."
                         .into(),
                 );
                 raw_text.clone()
@@ -338,6 +338,9 @@ impl DictationEngine {
         on_stage("needs_delivery");
         let inserted = match insert(&final_text) {
             Ok(()) => true,
+            // Recovery/reprocessing: stored a "Could not insert text" warning
+            // on every recovered entry although nothing went wrong.
+            Err(Error::DeliverySkipped) => false,
             Err(error) => {
                 warn!(error = %error, "insertion failed");
                 warnings.push(format!("Could not insert text: {error}"));

@@ -14,7 +14,9 @@ describe("backend message localization", () => {
 
   it("keeps provider details and prefers the most specific rule", () => {
     expect(localizeMessage("AI cleanup unavailable (provider error (429): llm: rate limited — retry shortly); inserted raw transcript", "zh-CN", zh))
-      .toBe("AI 润色不可用（provider error (429): llm: rate limited — retry shortly），已插入原始转写。");
+      .toBe("AI 润色不可用（provider error (429): llm: rate limited — retry shortly），已使用原始转写。");
+    expect(localizeMessage("AI cleanup unavailable (network error: timeout); used the raw transcript", "zh-CN", zh))
+      .toBe("AI 润色不可用（network error: timeout），已使用原始转写。");
     expect(localizeMessage("Could not insert text: text insertion failed: the focused target changed before delivery", "zh-CN", zh))
       .toBe("插入前焦点应用已改变，文字已复制到剪贴板。");
   });

@@ -34,7 +34,8 @@ use windows::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationTextPattern, UIA_TextPatternId,
+    CUIAutomation, IUIAutomation, IUIAutomationTextPattern, TextPatternRangeEndpoint_End,
+    TextPatternRangeEndpoint_Start, TextUnit_Character, UIA_TextPatternId,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
@@ -414,6 +415,46 @@ impl ContextProvider for WindowsContext {
         info.selection_supported = true;
         info.accessibility_ok = true;
         Ok(info)
+    }
+
+    fn text_before_caret(&self, max_chars: usize) -> Option<String> {
+        if max_chars == 0 {
+            return None;
+        }
+        let automation = automation().ok()?;
+        unsafe {
+            let element = automation.GetFocusedElement().ok()?;
+            if element
+                .CurrentIsPassword()
+                .is_ok_and(|secure| secure.as_bool())
+            {
+                return None;
+            }
+            let pattern = element
+                .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                .ok()?;
+            let ranges = pattern.GetSelection().ok()?;
+            if ranges.Length().ok()? < 1 {
+                return None;
+            }
+            // The selection (degenerate at the caret) extended backwards.
+            let before = ranges.GetElement(0).ok()?.Clone().ok()?;
+            before
+                .MoveEndpointByUnit(
+                    TextPatternRangeEndpoint_Start,
+                    TextUnit_Character,
+                    -(max_chars.min(4000) as i32),
+                )
+                .ok()?;
+            before
+                .MoveEndpointByRange(
+                    TextPatternRangeEndpoint_End,
+                    &ranges.GetElement(0).ok()?,
+                    TextPatternRangeEndpoint_Start,
+                )
+                .ok()?;
+            Some(before.GetText(-1).ok()?.to_string())
+        }
     }
 
     fn replace_selection(&self, expected: &TargetInfo, text: &str) -> Result<()> {

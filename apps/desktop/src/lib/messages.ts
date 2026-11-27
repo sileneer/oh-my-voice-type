@@ -17,7 +17,8 @@ const rules: Array<{ match: RegExp; key: MessageKey; detail?: number }> = [
   { match: /Nothing heard/i, key: "msg.nothingHeard" },
   { match: /No sound from the microphone/i, key: "msg.noSound" },
   { match: /copied to the clipboard — paste it manually/i, key: "msg.copied" },
-  { match: /AI cleanup unavailable \((.*)\); inserted raw transcript/i, key: "msg.cleanupUnavailable", detail: 1 },
+  // "inserted raw transcript" is the wording older history entries stored.
+  { match: /AI cleanup unavailable \((.*)\); (?:inserted|used the) raw transcript/i, key: "msg.cleanupUnavailable", detail: 1 },
   { match: /AI cleanup is off/i, key: "msg.cleanupOff" },
   { match: /select an ASR profile|ASR API key missing|ASR profile is not configured/i, key: "msg.asrMissing" },
   { match: /LLM is required|LLM API key missing|bound LLM API key is missing|LLM profile is not configured/i, key: "msg.llmRequired" },
