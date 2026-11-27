@@ -5,6 +5,7 @@ import { api, events, type Mode } from "./lib/api";
 import { useTheme } from "./lib/theme";
 import { makeT, resolveLocale } from "./i18n";
 import { cn } from "./lib/utils";
+import { localizeMessage } from "./lib/messages";
 
 type Phase =
   | { kind: "idle" }
@@ -88,7 +89,7 @@ export default function Pill() {
       case "processing": return t("pill.processing");
       case "cancelling": return t("common.cancel");
       case "done": return t("pill.done");
-      case "error": return phase.message;
+      case "error": return localizeMessage(phase.message, locale, t);
     }
   })();
   const StatusIcon = phase.kind === "done" ? Check : phase.kind === "error" ? TriangleAlert : active && phase.kind !== "recording" ? LoaderCircle : ModeIcon;

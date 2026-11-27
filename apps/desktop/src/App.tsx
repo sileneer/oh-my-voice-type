@@ -3,6 +3,7 @@ import { toast, Toaster } from "sonner";
 import { api, events, missingProfileStatus, type ApiStatus, type Mode, type SessionState, type Settings } from "./lib/api";
 import { useTheme, normalizeThemePreference } from "./lib/theme";
 import { makeT, resolveLocale } from "./i18n";
+import { localizeMessage } from "./lib/messages";
 import { AppShell } from "./components/app/AppShell";
 import { HomePage } from "./components/home/HomePage";
 import HistoryList from "./components/HistoryList";
@@ -67,8 +68,13 @@ export default function App() {
 
   useEffect(() => {
     const unlisteners: Array<() => void> = [];
-    void events.onSessionWarning((message) => toast.warning(message)).then((u) => unlisteners.push(u));
-    void events.onSessionError((message) => toast.error(message)).then((u) => unlisteners.push(u));
+    // Backend messages are English; translate the known ones for the UI locale.
+    const localized = (message: string) => {
+      const current = resolveLocale(localeRef.current);
+      return localizeMessage(message, current, makeT(current));
+    };
+    void events.onSessionWarning((message) => toast.warning(localized(message))).then((u) => unlisteners.push(u));
+    void events.onSessionError((message) => toast.error(localized(message))).then((u) => unlisteners.push(u));
     void events.onSettingsChanged((next) => {
       setSettings(next);
       setMode(next.dictation.default_mode ?? "dictate");
@@ -81,7 +87,7 @@ export default function App() {
       }
       const valid: SessionState[] = ["idle", "starting", "recording", "processing", "cancelling", "error"];
       setSession(valid.includes(event.state as SessionState) ? event.state as SessionState : "idle");
-      if (event.state === "error" && event.message) toast.error(event.message);
+      if (event.state === "error" && event.message) toast.error(localized(event.message));
       if (event.state === "idle") { activeSessionId.current = null; setLevel(0); void refreshPending(); }
     }).then((u) => unlisteners.push(u));
     void events.onSessionLevel((value) => setLevel(value)).then((u) => unlisteners.push(u));

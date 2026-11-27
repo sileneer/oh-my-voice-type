@@ -9,6 +9,7 @@ import {
 import { toast } from "sonner";
 import { localizeHotkey, type Locale, type MessageKey, type TFunc } from "../i18n";
 import { formatWhen } from "../lib/format";
+import { localizeMessage } from "../lib/messages";
 import { cn } from "../lib/utils";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -227,7 +228,7 @@ export default function HistoryList({ locale, t, hotkey = "right-alt" }: { local
                       ? <p className="mt-1 text-xs text-warning">{t("history.pendingNoAudio")}</p>
                       // The backend stores the bare stage name ("interrupted")
                       // when there is no real error; the stage is shown already.
-                      : record.error && record.error !== record.stage && <p className="mt-1 line-clamp-2 break-words text-xs text-warning">{record.error}</p>}
+                      : record.error && record.error !== record.stage && <p className="mt-1 line-clamp-2 break-words text-xs text-warning">{localizeMessage(record.error, locale, t)}</p>}
                   </div>
                   <div className="flex flex-wrap gap-1.5">
                     <Button type="button" variant="outline" size="sm" disabled={!retryable || busy} onClick={() => void retryPending(record)}>{busy ? <LoaderCircle className="size-4 animate-spin" aria-hidden="true" /> : <RotateCcw className="size-4" aria-hidden="true" />}{t("history.pendingRetry")}</Button>
@@ -331,7 +332,7 @@ function HistoryDetailSheet({ entry, locale, t, onClose, onCopy, onDelete, onRep
             <div><dt className="text-xs text-muted-foreground">{t("history.filter.delivery")}</dt><dd><DeliveryBadge entry={entry} t={t} /></dd></div>
             <div><dt className="text-xs text-muted-foreground">{t("home.translateTarget")}</dt><dd>{entry.target_language || "—"}</dd></div>
           </dl>
-          {entry.warnings && entry.warnings.length > 0 && <div className="rounded-md border border-warning/25 bg-warning/10 p-3 text-sm text-warning">{entry.warnings.join("\n")}</div>}
+          {entry.warnings && entry.warnings.length > 0 && <div className="whitespace-pre-line rounded-md border border-warning/25 bg-warning/10 p-3 text-sm text-warning">{entry.warnings.map((warning) => localizeMessage(warning, locale, t)).join("\n")}</div>}
           <div className="flex flex-wrap gap-2 border-t border-border pt-4">
             <Button type="button" variant="outline" size="sm" onClick={() => onCopy(entry.final_text || entry.raw_text)}><Copy className="size-4" aria-hidden="true" />{t("history.copy")}</Button>
             <Button type="button" variant="outline" size="sm" onClick={() => onReprocess(entry)} disabled={entry.mode === "edit_selection"}><RotateCcw className="size-4" aria-hidden="true" />{t("history.reprocess")}</Button>
