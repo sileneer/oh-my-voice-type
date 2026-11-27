@@ -225,7 +225,9 @@ export default function HistoryList({ locale, t, hotkey = "right-alt" }: { local
                     <p className="mt-0.5 text-xs text-muted-foreground">{formatWhen(record.created_at_ms, locale)} · {t("history.pendingStage", { stage: stageLabel(record.stage, t) })}</p>
                     {!retryable
                       ? <p className="mt-1 text-xs text-warning">{t("history.pendingNoAudio")}</p>
-                      : record.error && <p className="mt-1 line-clamp-2 break-words text-xs text-warning">{record.error}</p>}
+                      // The backend stores the bare stage name ("interrupted")
+                      // when there is no real error; the stage is shown already.
+                      : record.error && record.error !== record.stage && <p className="mt-1 line-clamp-2 break-words text-xs text-warning">{record.error}</p>}
                   </div>
                   <div className="flex flex-wrap gap-1.5">
                     <Button type="button" variant="outline" size="sm" disabled={!retryable || busy} onClick={() => void retryPending(record)}>{busy ? <LoaderCircle className="size-4 animate-spin" aria-hidden="true" /> : <RotateCcw className="size-4" aria-hidden="true" />}{t("history.pendingRetry")}</Button>

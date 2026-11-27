@@ -242,8 +242,11 @@ pub fn start_from_own_ui(
         .context
         .capture()
         .is_ok_and(|target| platform::is_own_target(&target));
+    tracing::info!(own_foreground, source = ?request.source, "starting from own UI");
     platform::yield_focus_to_previous_app(app, own_foreground);
-    start(app, request)
+    let result = start(app, request);
+    tracing::info!(ok = result.is_ok(), "own-UI start finished");
+    result
 }
 
 fn validate_edit_target(target: &TargetInfo) -> ovt_core::Result<()> {
@@ -634,6 +637,27 @@ fn fail_task(app: &AppHandle, meta: &SessionMeta, message: &str) {
     finish_with_message(app, meta, message);
 }
 
+/// A hotkey or tray start that failed before any session existed (no provider,
+/// app itself focused, …). The main window is usually hidden or minimized
+/// then, so a toast alone was invisible and the press appeared to do nothing:
+/// show the message in the pill too, then return everything to idle.
+pub fn report_start_error(app: &AppHandle, message: &str) {
+    eprintln!("session start failed: {message}");
+    let _ = app.emit(
+        "session:state",
+        serde_json::json!({ "state": "error", "message": message }),
+    );
+    pill_show(app);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        if !is_active() {
+            pill_hide(&app);
+            let _ = app.emit("session:state", serde_json::json!({ "state": "idle" }));
+        }
+    });
+}
+
 /// End a session that produced no text. The pill and the main window get one
 /// `error` state carrying the message (one toast, no duplicate warning), then
 /// return to `idle`; without that `idle` the main window stayed stuck on
@@ -956,10 +980,7 @@ fn spawn_hotkey_worker(
                             Ok(started) => set_owner(mode, Some(started.session_id)),
                             Err(error) => {
                                 set_owner(mode, None);
-                                let _ = app.emit(
-                                    "session:error",
-                                    serde_json::json!({ "message": error.to_string() }),
-                                );
+                                report_start_error(&app, &error.to_string());
                             }
                         }
                     }
@@ -1197,6 +1218,8 @@ pub async fn retry_pending(app: &AppHandle, id: String) -> ovt_core::Result<Pend
     };
     let now = ovt_core::dictation::unix_now_ms();
     task.attempts = task.attempts.saturating_add(1);
+    // The previous failure no longer applies while this attempt runs.
+    task.error = None;
     if !task.transition(PendingStatus::Queued, now) {
         return Err(ovt_core::Error::Db(
             "invalid pending retry transition".into(),

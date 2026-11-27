@@ -42,10 +42,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, PostThreadMessageW,
-    SetForegroundWindow, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION,
-    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
-    WM_SYSKEYDOWN, WM_SYSKEYUP,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    PostThreadMessageW, SetForegroundWindow, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL,
+    WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 pub use super::{ContextProvider, TargetInfo, TextInserter};
@@ -180,6 +180,10 @@ fn send_paste_keystrokes() -> Result<()> {
     Ok(())
 }
 
+/// Marks keystrokes this app synthesizes (paste, menu mask) so its own hook
+/// can tell them apart from other injected input ("OVT" + 0x01).
+const OVT_INJECTED_TAG: usize = 0x4F56_5401;
+
 fn key_input(vk: u16, up: bool) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
@@ -193,7 +197,7 @@ fn key_input(vk: u16, up: bool) -> INPUT {
                     KEYBD_EVENT_FLAGS(0)
                 },
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: OVT_INJECTED_TAG,
             },
         },
     }
@@ -499,12 +503,40 @@ pub fn start_foreground_tracker() {
             let own = unsafe { GetCurrentProcessId() };
             loop {
                 let hwnd = unsafe { GetForegroundWindow() };
-                if !hwnd.0.is_null() && foreground_pid(hwnd).is_some_and(|pid| pid != own) {
+                if !hwnd.0.is_null()
+                    && foreground_pid(hwnd).is_some_and(|pid| pid != own)
+                    && unsafe { IsWindowVisible(hwnd) }.as_bool()
+                    && !is_shell_surface(&window_class(hwnd))
+                {
                     LAST_EXTERNAL_FOREGROUND.store(hwnd.0 as isize, Ordering::Relaxed);
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
         });
+}
+
+/// Taskbar, tray overflow, desktop and Start/flyout hosts briefly take the
+/// foreground when the user reaches for the tray icon. They are not places to
+/// type into, and recording them made a tray start hand focus to a flyout that
+/// had already closed, so the start failed.
+fn is_shell_surface(class: &str) -> bool {
+    matches!(
+        class,
+        "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "NotifyIconOverflowWindow"
+            | "TopLevelWindowForOverflowXamlIsland"
+            | "XamlExplorerHostIslandWindow"
+            | "Windows.UI.Core.CoreWindow"
+            | "Progman"
+            | "WorkerW"
+    )
+}
+
+fn window_class(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    String::from_utf16_lossy(&buf[..(n.max(0) as usize).min(buf.len())])
 }
 
 /// Bring back the last external app. Allowed by Windows' foreground lock
@@ -718,9 +750,13 @@ const ALTGR_FAKE_LCTRL_SCAN: u32 = 0x21D;
 fn is_ignored_hook_event(kb: &KBDLLHOOKSTRUCT) -> bool {
     // Our own SendInput (paste keystrokes, the menu mask) must not reach the
     // gesture decoder, where it would look like a chord and cancel the take.
-    let injected = kb.flags.0 & LLKHF_INJECTED.0 != 0;
+    // Match only events this app injected (tagged via `dwExtraInfo`). Ignoring
+    // every LLKHF_INJECTED event also dropped keys from remappers (PowerToys
+    // Keyboard Manager, AutoHotkey), the On-Screen Keyboard and accessibility
+    // tools, so a key remapped to Right Alt could no longer start dictation.
+    let ours = kb.flags.0 & LLKHF_INJECTED.0 != 0 && kb.dwExtraInfo == OVT_INJECTED_TAG;
     let altgr_ctrl = kb.vkCode == 0xA2 && kb.scanCode == ALTGR_FAKE_LCTRL_SCAN;
-    injected || altgr_ctrl
+    ours || altgr_ctrl
 }
 
 fn send_menu_mask() {
@@ -803,6 +839,10 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     if is_target {
                         ctx.key_down = edge == Edge::Down;
                     }
+                    if is_target && edge == Edge::Down {
+                        ctx.decoder
+                            .sync_session(SESSION_ACTIVE.load(Ordering::SeqCst));
+                    }
                     let event = if is_target {
                         ctx.decoder.on_edge(edge, Instant::now())
                     } else if edge == Edge::Down {
@@ -854,18 +894,30 @@ mod tests {
 
     #[test]
     fn injected_and_altgr_events_are_ignored() {
-        let event = |vk: u32, scan: u32, flags: u32| KBDLLHOOKSTRUCT {
+        let tagged = |vk: u32, scan: u32, flags: u32, extra: usize| KBDLLHOOKSTRUCT {
             vkCode: vk,
             scanCode: scan,
             flags: windows::Win32::UI::WindowsAndMessaging::KBDLLHOOKSTRUCT_FLAGS(flags),
+            dwExtraInfo: extra,
             ..KBDLLHOOKSTRUCT::default()
         };
-        // Our own Ctrl+V and menu-mask keystrokes.
-        assert!(is_ignored_hook_event(&event(0x56, 0x2F, LLKHF_INJECTED.0)));
-        assert!(is_ignored_hook_event(&event(
-            u32::from(VK_MENU_MASK),
-            0,
-            LLKHF_INJECTED.0
+        let event = |vk: u32, scan: u32, flags: u32| tagged(vk, scan, flags, 0);
+        // Our own Ctrl+V and menu-mask keystrokes carry the tag.
+        let ours = |vk: u16| {
+            // SAFETY: key_input always builds a keyboard INPUT.
+            let extra = unsafe { key_input(vk, false).Anonymous.ki.dwExtraInfo };
+            tagged(u32::from(vk), 0, LLKHF_INJECTED.0, extra)
+        };
+        assert!(is_ignored_hook_event(&ours(VK_V.0)));
+        assert!(is_ignored_hook_event(&ours(VK_MENU_MASK)));
+        // Other injectors (PowerToys remaps, AutoHotkey, OSK) still count:
+        // a key remapped to Right Alt must start dictation.
+        assert!(!is_ignored_hook_event(&event(0xA5, 0x38, LLKHF_INJECTED.0)));
+        assert!(!is_ignored_hook_event(&tagged(
+            0xA5,
+            0x38,
+            LLKHF_INJECTED.0,
+            7
         )));
         // AltGr's synthesized left Ctrl.
         assert!(is_ignored_hook_event(&event(

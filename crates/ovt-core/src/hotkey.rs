@@ -112,6 +112,17 @@ impl GestureDecoder {
         }
     }
 
+    /// Tell the decoder whether the host still has a live session. A latched
+    /// take whose session is gone (its start failed, or it was cancelled from
+    /// the UI, by Esc or by the time limit) must not turn the next press into
+    /// a Stop for nothing: that press would be swallowed and the user had to
+    /// press twice to start again. Call before feeding a key-down edge.
+    pub fn sync_session(&mut self, session_active: bool) {
+        if !session_active && matches!(self.state, State::Latched) {
+            self.state = State::Idle;
+        }
+    }
+
     pub fn reset(&mut self) {
         self.state = State::Idle;
     }
@@ -193,6 +204,27 @@ mod tests {
             assert_eq!(events[0], Some(HotkeyEvent::Start));
             assert_ne!(events[2], Some(HotkeyEvent::Start), "{events:?}");
         }
+    }
+
+    #[test]
+    fn press_after_a_dead_latched_take_starts_again() {
+        let mut d = GestureDecoder::default();
+        let t0 = Instant::now();
+        assert_eq!(d.on_edge(Edge::Down, t0), Some(HotkeyEvent::Start));
+        assert_eq!(d.on_edge(Edge::Up, t0 + Duration::from_millis(80)), None);
+        // The host's start failed (or the take was cancelled elsewhere).
+        d.sync_session(false);
+        assert_eq!(
+            d.on_edge(Edge::Down, t0 + Duration::from_millis(900)),
+            Some(HotkeyEvent::Start)
+        );
+        // While the session is live, the next press still stops it.
+        assert_eq!(d.on_edge(Edge::Up, t0 + Duration::from_millis(950)), None);
+        d.sync_session(true);
+        assert_eq!(
+            d.on_edge(Edge::Down, t0 + Duration::from_millis(1500)),
+            Some(HotkeyEvent::Stop)
+        );
     }
 
     #[test]

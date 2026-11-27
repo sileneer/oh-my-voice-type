@@ -1,12 +1,57 @@
 use ovt_core::config::SessionMode;
-use tauri::menu::{Menu, MenuBuilder, MenuItem};
+use std::sync::Mutex;
+use tauri::menu::{MenuBuilder, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Wry};
 
 const TRAY_ID: &str = "ovt-tray";
 
+/// The tray menu is built once and its items are updated in place. Building a
+/// new menu and swapping it in with `set_menu` on every state change (from
+/// worker threads) left a menu whose clicks never reached the handler on
+/// Windows: "Stop and transcribe" did nothing during a recording.
+struct TrayItems {
+    show: MenuItem<Wry>,
+    dictate: MenuItem<Wry>,
+    translate: MenuItem<Wry>,
+    edit: MenuItem<Wry>,
+    stop: MenuItem<Wry>,
+    recovery: MenuItem<Wry>,
+    settings: MenuItem<Wry>,
+    update: MenuItem<Wry>,
+    quit: MenuItem<Wry>,
+}
+
+static ITEMS: Mutex<Option<TrayItems>> = Mutex::new(None);
+
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
-    let menu = build_menu(app, false)?;
+    let item = |id: &'static str| MenuItem::with_id(app, id, id, true, None::<&str>);
+    let items = TrayItems {
+        show: item("show")?,
+        dictate: item("dictate")?,
+        translate: item("translate")?,
+        edit: item("edit")?,
+        stop: item("stop")?,
+        recovery: item("recovery")?,
+        settings: item("settings")?,
+        update: item("update")?,
+        quit: item("quit")?,
+    };
+    let menu = MenuBuilder::new(app)
+        .item(&items.show)
+        .separator()
+        .item(&items.dictate)
+        .item(&items.translate)
+        .item(&items.edit)
+        .item(&items.stop)
+        .separator()
+        .item(&items.recovery)
+        .item(&items.settings)
+        .item(&items.update)
+        .separator()
+        .item(&items.quit)
+        .build()?;
+    *ITEMS.lock().unwrap_or_else(|error| error.into_inner()) = Some(items);
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("oh-my-voice-type")
         .menu(&menu)
@@ -33,11 +78,10 @@ pub fn update(app: &AppHandle) {
         .try_state::<crate::commands::AppState>()
         .and_then(|state| state.pending.as_ref().and_then(|repo| repo.list().ok()))
         .map_or(0, |tasks| tasks.len());
-    let locale = app
+    let zh = app
         .try_state::<crate::commands::AppState>()
         .and_then(|state| state.config.snapshot().ok())
-        .map_or_else(|| "en".to_string(), |settings| settings.ui.locale);
-    let zh = locale == "zh-CN";
+        .is_some_and(|settings| settings.ui.locale == "zh-CN");
     let tooltip = if active {
         if zh {
             "正在录音或处理…".to_string()
@@ -54,93 +98,71 @@ pub fn update(app: &AppHandle) {
         "oh-my-voice-type".to_string()
     };
     let _ = tray.set_tooltip(Some(tooltip));
-    if let Ok(menu) = build_menu(app, active) {
-        let _ = tray.set_menu(Some(menu));
-    }
+
+    let guard = ITEMS.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(items) = guard.as_ref() else {
+        return;
+    };
+    let label = |en: &str, zh_text: &str| {
+        if zh {
+            zh_text.to_string()
+        } else {
+            en.to_string()
+        }
+    };
+    let set = |item: &MenuItem<Wry>, text: String, enabled: bool| {
+        let _ = item.set_text(text);
+        let _ = item.set_enabled(enabled);
+    };
+    set(
+        &items.show,
+        label("Open oh-my-voice-type", "打开 oh-my-voice-type"),
+        true,
+    );
+    set(&items.dictate, label("Dictate", "听写"), !active);
+    set(&items.translate, label("Translate", "翻译"), !active);
+    set(&items.edit, label("Edit selection", "编辑选区"), !active);
+    set(
+        &items.stop,
+        label("Stop and transcribe", "停止并转写"),
+        active,
+    );
+    set(
+        &items.recovery,
+        label("Interrupted sessions", "中断的会话"),
+        true,
+    );
+    set(&items.settings, label("Settings", "设置"), true);
+    set(&items.update, update_label(zh), true);
+    set(&items.quit, label("Quit", "退出"), true);
 }
 
-fn build_menu(app: &AppHandle, active: bool) -> tauri::Result<Menu<tauri::Wry>> {
-    let locale = app
-        .try_state::<crate::commands::AppState>()
-        .and_then(|state| state.config.snapshot().ok())
-        .map_or_else(|| "en".to_string(), |settings| settings.ui.locale);
-    let zh = locale == "zh-CN";
+fn update_label(zh: bool) -> String {
     let updater = crate::updater::status();
-    let update_label = match (updater.status, updater.update.as_ref()) {
-        (crate::updater::UpdaterStatus::Ready, _) => {
-            if zh {
-                "重启以完成更新".to_string()
-            } else {
-                "Restart to finish update".to_string()
-            }
-        }
-        (crate::updater::UpdaterStatus::Available, Some(info)) => {
-            if zh {
-                format!("安装更新 {}", info.version)
-            } else {
-                format!("Install update {}", info.version)
-            }
-        }
+    let (en, zh_text) = match (updater.status, updater.update.as_ref()) {
+        (crate::updater::UpdaterStatus::Ready, _) => (
+            "Restart to finish update".to_string(),
+            "重启以完成更新".to_string(),
+        ),
+        (crate::updater::UpdaterStatus::Available, Some(info)) => (
+            format!("Install update {}", info.version),
+            format!("安装更新 {}", info.version),
+        ),
         (
             crate::updater::UpdaterStatus::Downloading | crate::updater::UpdaterStatus::Installing,
             _,
-        ) => {
-            if zh {
-                "正在更新…".to_string()
-            } else {
-                "Updating…".to_string()
-            }
-        }
-        _ => {
-            if zh {
-                "检查更新".to_string()
-            } else {
-                "Check for updates".to_string()
-            }
-        }
+        ) => ("Updating…".to_string(), "正在更新…".to_string()),
+        _ => ("Check for updates".to_string(), "检查更新".to_string()),
     };
-    let item = |id: &'static str, en_text: &'static str, zh_text: &'static str, enabled| {
-        MenuItem::with_id(
-            app,
-            id,
-            if zh { zh_text } else { en_text },
-            enabled,
-            None::<&str>,
-        )
-    };
-    MenuBuilder::new(app)
-        .item(&item(
-            "show",
-            "Open oh-my-voice-type",
-            "打开 oh-my-voice-type",
-            true,
-        )?)
-        .separator()
-        .item(&item("dictate", "Dictate", "听写", !active)?)
-        .item(&item("translate", "Translate", "翻译", !active)?)
-        .item(&item("edit", "Edit selection", "编辑选区", !active)?)
-        .item(&item("stop", "Stop and transcribe", "停止并转写", active)?)
-        .separator()
-        .item(&item(
-            "recovery",
-            "Interrupted sessions",
-            "中断的会话",
-            true,
-        )?)
-        .item(&item("settings", "Settings", "设置", true)?)
-        .item(&MenuItem::with_id(
-            app,
-            "update",
-            update_label,
-            true,
-            None::<&str>,
-        )?)
-        .separator()
-        .item(&item("quit", "Quit", "退出", true)?)
-        .build()
+    if zh {
+        zh_text
+    } else {
+        en
+    }
 }
 
 fn handle_menu(app: &AppHandle, id: &str) {
+    tracing::info!(menu = id, "tray menu item selected");
     match id {
         "show" => show_main(app),
         "dictate" => spawn_start(app, SessionMode::Dictate),
@@ -199,10 +221,7 @@ fn spawn_start(app: &AppHandle, mode: SessionMode) {
                 source: crate::dictation::SessionSource::Tray,
             },
         ) {
-            let _ = app.emit(
-                "session:error",
-                serde_json::json!({ "message": error.to_string() }),
-            );
+            crate::dictation::report_start_error(&app, &error.to_string());
         }
     });
 }

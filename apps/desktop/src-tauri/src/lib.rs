@@ -17,7 +17,9 @@ pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ovt=info".into()),
+                // Targets are module paths; "ovt=info" matched none of them,
+                // so the app logged nothing by default.
+                .unwrap_or_else(|_| "ovt_desktop_lib=info,ovt_core=info".into()),
         )
         .init();
 

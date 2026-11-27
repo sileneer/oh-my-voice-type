@@ -387,6 +387,9 @@ impl HotkeyListener for MacHotkey {
                                 _ => None,
                             };
                             *was_down = down;
+                            if edge == Some(Edge::Down) {
+                                d.sync_session(SESSION_ACTIVE.load(Ordering::SeqCst));
+                            }
                             if let Some(edge) = edge {
                                 if let Some(ev) = d.on_edge(edge, std::time::Instant::now()) {
                                     callback(ev);

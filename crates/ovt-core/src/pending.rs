@@ -61,6 +61,11 @@ impl PendingStatus {
             (self, next),
             (Capturing, Queued)
                 | (Capturing, Failed)
+                // A crash or kill while recording: the WAV is flushed every
+                // second, so the take is recoverable. Without this transition
+                // startup recovery silently left it "capturing" forever, shown
+                // as still recording and impossible to retry.
+                | (Capturing, Interrupted)
                 | (Queued, Transcribing)
                 | (Queued, Failed)
                 | (Queued, Interrupted)
@@ -220,6 +225,17 @@ mod tests {
         assert!(!task.transition(PendingStatus::Completed, 1));
         assert!(!task.transition(PendingStatus::Delivering, 1));
         assert_eq!(task.status, PendingStatus::Capturing);
+    }
+
+    #[test]
+    fn crash_while_recording_recovers_to_a_retryable_task() {
+        let mut task = PendingTask::new("p".into(), "s".into(), SessionMode::Dictate);
+        task.status = PendingStatus::Capturing;
+        let next = task.recovery_status();
+        assert_eq!(next, PendingStatus::Interrupted);
+        assert!(task.transition(next, 10));
+        assert!(task.status.allows_retry());
+        assert!(task.transition(PendingStatus::Queued, 20));
     }
 
     #[test]
