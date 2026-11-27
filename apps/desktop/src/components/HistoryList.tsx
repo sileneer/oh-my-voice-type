@@ -43,6 +43,7 @@ export default function HistoryList({ locale, t, hotkey = "right-alt" }: { local
   const [discardTarget, setDiscardTarget] = useState<PendingRecord | null>(null);
   const [dictionaryOpen, setDictionaryOpen] = useState(false);
   const [dictionaryTerm, setDictionaryTerm] = useState("");
+  const [retrying, setRetrying] = useState<Set<string>>(() => new Set());
   const requestId = useRef(0);
   const entriesRef = useRef(0);
   useEffect(() => { entriesRef.current = entries.length; }, [entries.length]);
@@ -95,6 +96,15 @@ export default function HistoryList({ locale, t, hotkey = "right-alt" }: { local
     });
     return () => { active = false; unsubscribe(); };
   }, [loadPending]);
+  // A dictation finished while this page is open: show it without a reload.
+  useEffect(() => {
+    let active = true;
+    let unsubscribe = () => {};
+    void events.onSessionOutcome(() => { if (active) void load(); }).then((fn) => {
+      if (active) unsubscribe = fn; else fn();
+    });
+    return () => { active = false; unsubscribe(); };
+  }, [load]);
 
   // Action failures go to a toast; the inline banner is kept for load failures.
   const fail = (cause: unknown) => { toast.error(String(cause)); };
@@ -131,7 +141,28 @@ export default function HistoryList({ locale, t, hotkey = "right-alt" }: { local
     try { await api.dictionaryAdd(dictionaryTerm.trim()); setDictionaryOpen(false); setDictionaryTerm(""); } catch (cause) { fail(cause); }
   };
   const retryPending = async (record: PendingRecord) => {
-    try { await api.pendingRetry(record.id); await loadPending(); } catch (cause) { fail(cause); }
+    if (retrying.has(record.id)) return;
+    setRetrying((current) => new Set(current).add(record.id));
+    try {
+      await api.pendingRetry(record.id);
+      toast.success(t("history.pendingRetried"));
+      // The recovered text is a new history entry, not just a removed row.
+      await load();
+    } catch (cause) {
+      fail(cause);
+    } finally {
+      setRetrying((current) => { const next = new Set(current); next.delete(record.id); return next; });
+      await loadPending();
+    }
+  };
+  // Dictionary entries are words, not whole sentences: offer the text the user
+  // highlighted in the details sheet, otherwise start empty.
+  const openDictionary = () => {
+    setDictionaryTerm(window.getSelection()?.toString().trim().slice(0, 80) ?? "");
+    setDictionaryOpen(true);
+  };
+  const exportAudio = async (id: string) => {
+    try { if (await api.historyExportAudio(id)) toast.success(t("history.audioExported")); } catch (cause) { fail(cause); }
   };
   const discardPending = async () => {
     if (!discardTarget) return;
@@ -181,20 +212,29 @@ export default function HistoryList({ locale, t, hotkey = "right-alt" }: { local
         <section className="mt-6">
           <h2 className="mb-3 text-sm font-semibold">{t("history.pendingTitle")}</h2>
           <div className="flex flex-col gap-2">
-            {pending.map((record) => (
-              <div key={record.id} className="flex flex-wrap items-center gap-3 rounded-lg border border-warning/25 bg-warning/10 p-3">
-                <TriangleAlert className="size-4 shrink-0 text-warning" aria-hidden="true" />
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-medium">{record.final_text || record.raw_text || t("history.notInserted")}</p>
-                  <p className="mt-0.5 text-xs text-muted-foreground">{formatWhen(record.created_at_ms, locale)} · {t("history.pendingStage", { stage: stageLabel(record.stage, t) })}</p>
+            {pending.map((record) => {
+              const text = record.final_text || record.raw_text;
+              // Without audio or a transcript there is nothing to retry.
+              const retryable = record.has_audio || text !== "";
+              const busy = retrying.has(record.id);
+              return (
+                <div key={record.id} className="flex flex-wrap items-center gap-3 rounded-lg border border-warning/25 bg-warning/10 p-3">
+                  <TriangleAlert className="size-4 shrink-0 text-warning" aria-hidden="true" />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium">{text || t("history.notInserted")}</p>
+                    <p className="mt-0.5 text-xs text-muted-foreground">{formatWhen(record.created_at_ms, locale)} · {t("history.pendingStage", { stage: stageLabel(record.stage, t) })}</p>
+                    {!retryable
+                      ? <p className="mt-1 text-xs text-warning">{t("history.pendingNoAudio")}</p>
+                      : record.error && <p className="mt-1 line-clamp-2 break-words text-xs text-warning">{record.error}</p>}
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    <Button type="button" variant="outline" size="sm" disabled={!retryable || busy} onClick={() => void retryPending(record)}>{busy ? <LoaderCircle className="size-4 animate-spin" aria-hidden="true" /> : <RotateCcw className="size-4" aria-hidden="true" />}{t("history.pendingRetry")}</Button>
+                    <Button type="button" variant="ghost" size="sm" disabled={text === ""} onClick={() => void copy(text)}><Copy className="size-4" aria-hidden="true" />{t("history.pendingCopy")}</Button>
+                    <Button type="button" variant="ghost" size="sm" disabled={busy} onClick={() => setDiscardTarget(record)}><Trash2 className="size-4" aria-hidden="true" />{t("history.pendingDiscard")}</Button>
+                  </div>
                 </div>
-                <div className="flex flex-wrap gap-1.5">
-                  <Button type="button" variant="outline" size="sm" onClick={() => void retryPending(record)}><RotateCcw className="size-4" aria-hidden="true" />{t("history.pendingRetry")}</Button>
-                  <Button type="button" variant="ghost" size="sm" onClick={() => void copy(record.final_text || record.raw_text)}><Copy className="size-4" aria-hidden="true" />{t("history.pendingCopy")}</Button>
-                  <Button type="button" variant="ghost" size="sm" onClick={() => setDiscardTarget(record)}><Trash2 className="size-4" aria-hidden="true" />{t("history.pendingDiscard")}</Button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </section>
       )}
@@ -238,8 +278,8 @@ export default function HistoryList({ locale, t, hotkey = "right-alt" }: { local
         onCopy={(text) => void copy(text)}
         onDelete={(entry) => setDeleteTarget(entry)}
         onReprocess={(entry) => void reprocess(entry)}
-        onExportAudio={(id) => void api.historyExportAudio(id).catch(fail)}
-        onAddDictionary={() => { setDictionaryTerm(selected?.final_text.slice(0, 80) ?? ""); setDictionaryOpen(true); }}
+        onExportAudio={(id) => void exportAudio(id)}
+        onAddDictionary={openDictionary}
       />
 
       <AlertDialog open={deleteTarget !== null} onOpenChange={(open) => !open && setDeleteTarget(null)}>

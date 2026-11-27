@@ -41,6 +41,7 @@ pub fn run() {
                 return Err(Box::new(error));
             }
             dictation::init_session(&handle);
+            platform::start_foreground_tracker();
             updater::init(&handle);
             tray::init(&handle).map_err(|error| format!("tray initialization failed: {error}"))?;
             if let Err(e) = dictation::install_hotkey(&handle) {

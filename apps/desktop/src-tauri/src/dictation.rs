@@ -231,6 +231,22 @@ pub fn start(app: &AppHandle, request: SessionRequest) -> ovt_core::Result<Sessi
     })
 }
 
+/// Start from the main window or the tray, which put this app in the
+/// foreground: step aside to the user's previous app first. Blocking.
+pub fn start_from_own_ui(
+    app: &AppHandle,
+    request: SessionRequest,
+) -> ovt_core::Result<SessionStarted> {
+    let own_foreground = app
+        .state::<commands::AppState>()
+        .inserters
+        .context
+        .capture()
+        .is_ok_and(|target| platform::is_own_target(&target));
+    platform::yield_focus_to_previous_app(app, own_foreground);
+    start(app, request)
+}
+
 fn validate_edit_target(target: &TargetInfo) -> ovt_core::Result<()> {
     if target.secure_field {
         return Err(ovt_core::Error::Insert(
@@ -378,6 +394,17 @@ async fn run_session_inner(
         }
     }
     let (samples, rate) = state.inserters.audio.stop();
+    // Unmute as soon as capture ends; ASR and the LLM can take seconds and the
+    // user's audio should not stay muted while the text is processed.
+    if let Some(mut guard) = mute_guard.take() {
+        if let Err(error) = guard.restore() {
+            emit_warning(
+                app,
+                meta,
+                &format!("Could not restore output mute: {error}"),
+            );
+        }
+    }
     if let Some(error) = state.inserters.audio.pending_error() {
         return Err(ovt_core::Error::Audio(error));
     }
@@ -399,7 +426,14 @@ async fn run_session_inner(
     emit_state(app, "processing", meta, None);
 
     let (wav, peak) = audio::to_wav(&samples, rate);
-    ovt_core::dictation::ensure_has_audio(peak)?;
+    if let Err(error) = ovt_core::dictation::ensure_has_audio(peak) {
+        // A silent take (accidental tap, muted mic) has nothing to recover;
+        // keeping it would only add an un-retryable item to the recovery list.
+        let _ = pending.delete(&meta.pending_id);
+        remove_pending_audio(app, &meta.pending_id);
+        notify_pending(app);
+        return Err(error);
+    }
     let dictionary = state.dictionary.snapshot();
     let history = state.history.clone();
     let engine = DictationEngine::new(
@@ -509,21 +543,26 @@ async fn run_session_inner(
             }
         }
     }?;
-    if let Some(guard) = mute_guard.as_mut() {
-        if let Err(error) = guard.restore() {
-            emit_warning(
-                app,
-                meta,
-                &format!("Could not restore output mute: {error}"),
-            );
-        }
-    }
-    drop(mute_guard);
     if token.is_cancelled() {
         cancel_task(app, meta);
         return Ok(());
     }
     let mut outcome = outcome;
+    if outcome.final_text.trim().is_empty() {
+        // ASR heard nothing. The engine stops before any delivery stage, so the
+        // task is still `transcribing`: copying would wipe the user's clipboard
+        // with an empty string and `-> delivering` is an invalid transition.
+        let _ = pending.delete(&meta.pending_id);
+        remove_pending_audio(app, &meta.pending_id);
+        notify_pending(app);
+        let message = outcome
+            .warnings
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "Nothing heard — try again.".into());
+        finish_with_message(app, meta, &message);
+        return Ok(());
+    }
     let delivery_status = if outcome.inserted {
         pending.transition(
             &meta.pending_id,
@@ -543,9 +582,9 @@ async fn run_session_inner(
             PendingStatus::Completed,
             ovt_core::dictation::unix_now_ms(),
         )?;
-        outcome.warnings.push(
-            "Could not replace at the verified selection — text copied for manual paste.".into(),
-        );
+        outcome
+            .warnings
+            .push("The text was copied to the clipboard — paste it manually.".into());
         "copied"
     };
     if let Some(history) = &history {
@@ -593,20 +632,24 @@ fn fail_task(app: &AppHandle, meta: &SessionMeta, message: &str) {
             );
         }
     }
-    let mut payload = meta.payload("error");
-    payload["message"] = serde_json::json!(message);
-    let _ = app.emit("session:error", payload);
-    let _ = app.emit("session:warning", serde_json::json!({
-        "session_id": meta.id, "mode": meta.mode, "pending_id": meta.pending_id, "message": message
-    }));
+    finish_with_message(app, meta, message);
+}
+
+/// End a session that produced no text. The pill and the main window get one
+/// `error` state carrying the message (one toast, no duplicate warning), then
+/// return to `idle`; without that `idle` the main window stayed stuck on
+/// "processing" after every failure.
+fn finish_with_message(app: &AppHandle, meta: &SessionMeta, message: &str) {
     finish_active(app, meta);
-    update_tray(app);
-    let app_for_hide = app.clone();
-    tokio::spawn(async move {
+    emit_state(app, "error", meta, Some(message.to_string()));
+    let app = app.clone();
+    let meta = meta.clone();
+    tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         if !is_active() {
-            pill_hide(&app_for_hide);
+            pill_hide(&app);
         }
+        emit_state(&app, "idle", &meta, None);
     });
 }
 
@@ -642,6 +685,11 @@ fn cancel_task(app: &AppHandle, meta: &SessionMeta) {
 fn finalize_audio(_app: &AppHandle, pending_id: &str, keep: bool) -> ovt_core::Result<()> {
     let dir = commands::app_data_dir();
     let source = dir.join("pending-audio").join(format!("{pending_id}.wav"));
+    if !source.exists() {
+        // Nothing to retain or clean up (e.g. a recovered task whose audio was
+        // already removed); the text itself has been saved.
+        return Ok(());
+    }
     if keep {
         let destination_dir = dir.join("audio");
         std::fs::create_dir_all(&destination_dir)
@@ -1086,8 +1134,23 @@ pub async fn retry_pending(app: &AppHandle, id: String) -> ovt_core::Result<Pend
         build_session_providers(&settings, task.mode).map_err(ovt_core::Error::Config)?;
     let audio_path =
         crate::pending::resolve_audio_path(&commands::app_data_dir(), &task.audio_path)?;
-    let wav = std::fs::read(&audio_path)
-        .map_err(|error| ovt_core::Error::Audio(format!("read pending audio: {error}")))?;
+    // A transcript that was already produced only needs the rewrite step.
+    let wav = if task.raw_text.is_empty() {
+        let bytes = std::fs::read(&audio_path).map_err(|error| {
+            ovt_core::Error::Audio(format!(
+                "the recording for this session is missing ({error}); discard it"
+            ))
+        })?;
+        // The pending file is untrimmed PCM at the microphone's native rate
+        // (often 48 kHz). Providers are told the payload is 16 kHz, so run it
+        // through the same trim/resample as a live session.
+        let (samples, rate) = ovt_core::wav::decode_pcm16_wav(&bytes)?;
+        let (wav, peak) = audio::to_wav(&samples, rate);
+        ovt_core::dictation::ensure_has_audio(peak)?;
+        wav
+    } else {
+        Vec::new()
+    };
     let now = ovt_core::dictation::unix_now_ms();
     task.attempts = task.attempts.saturating_add(1);
     if !task.transition(PendingStatus::Queued, now) {
@@ -1112,7 +1175,7 @@ pub async fn retry_pending(app: &AppHandle, id: String) -> ovt_core::Result<Pend
     );
     let input = DictationInput {
         wav,
-        sample_rate: task.sample_rate,
+        sample_rate: ovt_core::wav::TARGET_SAMPLE_RATE,
         mode: Mode::from(task.mode),
         app_name: task.app_name.clone(),
         window_title: task.window_title.clone(),
@@ -1148,6 +1211,16 @@ pub async fn retry_pending(app: &AppHandle, id: String) -> ovt_core::Result<Pend
             .await
     };
     match result {
+        Ok(outcome) if outcome.final_text.trim().is_empty() => {
+            // Nothing was heard: no history row was written, so there is
+            // nothing to keep and nothing the user could deliver.
+            pending.delete(&task.id)?;
+            remove_pending_audio(app, &task.id);
+            notify_pending(app);
+            Err(ovt_core::Error::Audio(
+                "nothing was heard in this recording, so it was discarded".into(),
+            ))
+        }
         Ok(outcome) => {
             if let Some(history) = &state.history {
                 history.set_delivery(&outcome.id, "needs_review")?;

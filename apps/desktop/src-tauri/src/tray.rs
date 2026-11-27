@@ -191,7 +191,7 @@ fn spawn_start(app: &AppHandle, mode: SessionMode) {
             .try_state::<crate::commands::AppState>()
             .and_then(|state| state.config.snapshot().ok())
             .map(|settings| settings.dictation.translate_target);
-        if let Err(error) = crate::dictation::start(
+        if let Err(error) = crate::dictation::start_from_own_ui(
             &app,
             crate::dictation::SessionRequest {
                 mode,

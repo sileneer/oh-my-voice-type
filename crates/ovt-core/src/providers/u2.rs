@@ -326,7 +326,35 @@ fn join_transcript_text(value: &serde_json::Value) -> String {
             }
         }
     }
-    parts.join(" ")
+    join_segments(&parts)
+}
+
+/// Join recognized segments. A space belongs only between two Latin-script
+/// words; between Chinese/Japanese sentences it is a visible typo that is
+/// inserted verbatim whenever AI cleanup is off.
+fn join_segments(parts: &[String]) -> String {
+    let mut out = String::new();
+    for part in parts {
+        let needs_space = match (out.chars().last(), part.chars().next()) {
+            (Some(prev), Some(next)) => !is_spaceless(prev) && !is_spaceless(next),
+            _ => false,
+        };
+        if needs_space {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    out
+}
+
+/// CJK ideographs, kana, Hangul and full-width punctuation do not take spaces.
+fn is_spaceless(c: char) -> bool {
+    matches!(c as u32,
+        0x2E80..=0x9FFF      // CJK radicals, punctuation, kana, ideographs
+        | 0xAC00..=0xD7AF    // Hangul syllables
+        | 0xF900..=0xFAFF    // CJK compatibility ideographs
+        | 0xFF00..=0xFFEF    // full-width forms (，。！？)
+        | 0x20000..=0x2FFFF) // CJK extensions
 }
 
 #[async_trait]
@@ -411,6 +439,17 @@ mod tests {
         assert_eq!(join_transcript_text(&v), "direct");
         let v = json!({"results": []});
         assert_eq!(join_transcript_text(&v), "");
+    }
+
+    #[test]
+    fn chinese_segments_join_without_spaces() {
+        let v = json!({"results": [{"text": "你好。"}, {"text": "今天开会"}, {"text": "use Kubernetes"}, {"text": "部署。"}]});
+        assert_eq!(
+            join_transcript_text(&v),
+            "你好。今天开会use Kubernetes部署。"
+        );
+        let v = json!({"results": [{"text": "Hello."}, {"text": "How are you?"}]});
+        assert_eq!(join_transcript_text(&v), "Hello. How are you?");
     }
 
     #[test]

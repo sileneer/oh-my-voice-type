@@ -10,6 +10,7 @@ import {
 import { toast } from "sonner";
 import { localeOptions, localizeHotkey, translationTargets, type Locale, type TFunc } from "../i18n";
 import { normalizeThemePreference, themeOptions, useTheme } from "../lib/theme";
+import { hotkeyOptions } from "../lib/hotkeys";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Switch } from "./ui/switch";
@@ -35,7 +36,6 @@ interface Props {
   section?: { id: string; nonce: number } | null;
 }
 
-const HOTKEYS = ["fn", "right-opt", "right-cmd", "right-alt", "right-ctrl", "left-alt", "left-ctrl", "f6", "f7", "f8", "f9", "f10"];
 const NONE = "__none__";
 const KEEP_ALIVE = "mt-0 data-[state=inactive]:hidden";
 
@@ -145,12 +145,15 @@ function ModeSettings({ settings, locale, t, onSave, onError }: Pick<Props, "set
   const [saving, setSaving] = useState(false);
   useEffect(() => { setHotkey(settings.hotkey); setDictation(settings.dictation); setAudio(settings.audio); }, [settings.hotkey, settings.dictation, settings.audio]);
   const dirty = changed({ hotkey, dictation, audio }, { hotkey: settings.hotkey, dictation: settings.dictation, audio: settings.audio });
+  const duplicate = duplicateHotkey(hotkey);
+  const duplicateError = duplicate ? t("settings.hotkeyDuplicate", { key: localizeHotkey(locale, duplicate) }) : undefined;
   const save = async () => {
+    if (duplicate) return;
     setSaving(true);
     try { await onSave({ ...settings, hotkey, dictation, audio: { ...audio, max_recording_seconds: clampNumber(audio.max_recording_seconds ?? 540, 60, 900) } }); } catch (cause) { onError(String(cause)); } finally { setSaving(false); }
   };
   return (
-    <Section title={t("settings.modes")} footer={<SaveBar saving={saving} dirty={dirty} t={t} onClick={() => void save()} />}>
+    <Section title={t("settings.modes")} footer={<SaveBar saving={saving} dirty={dirty && !duplicate} t={t} onClick={() => void save()} />}>
       <div className="grid gap-4 sm:grid-cols-2">
         <Field label={t("settings.defaultMode")}>
           <Select value={dictation.default_mode ?? "dictate"} onValueChange={(value) => setDictation({ ...dictation, default_mode: value as Mode })}>
@@ -164,9 +167,9 @@ function ModeSettings({ settings, locale, t, onSave, onError }: Pick<Props, "set
         </Field>
       </div>
       <div className="grid gap-4 sm:grid-cols-3">
-        <HotkeyField label={t("hotkey.title")} value={hotkey.dictate} locale={locale} t={t} onChange={(value) => setHotkey({ ...hotkey, dictate: value })} />
-        <HotkeyField label={t("settings.translateHotkey")} value={hotkey.translate || NONE} locale={locale} t={t} onChange={(value) => setHotkey({ ...hotkey, translate: value === NONE ? "" : value })} optional />
-        <HotkeyField label={t("settings.editHotkey")} value={hotkey.edit_selection || NONE} locale={locale} t={t} onChange={(value) => setHotkey({ ...hotkey, edit_selection: value === NONE ? "" : value })} optional />
+        <HotkeyField label={t("hotkey.title")} value={hotkey.dictate} locale={locale} t={t} error={duplicate === hotkey.dictate ? duplicateError : undefined} onChange={(value) => setHotkey({ ...hotkey, dictate: value })} />
+        <HotkeyField label={t("settings.translateHotkey")} value={hotkey.translate || NONE} locale={locale} t={t} error={duplicate && duplicate === hotkey.translate ? duplicateError : undefined} onChange={(value) => setHotkey({ ...hotkey, translate: value === NONE ? "" : value })} optional />
+        <HotkeyField label={t("settings.editHotkey")} value={hotkey.edit_selection || NONE} locale={locale} t={t} error={duplicate && duplicate === hotkey.edit_selection ? duplicateError : undefined} onChange={(value) => setHotkey({ ...hotkey, edit_selection: value === NONE ? "" : value })} optional />
       </div>
       <ToggleRow label={t("hotkey.smart")} description={t("hotkey.hint.smart")} checked={hotkey.smart_gestures} onChange={(checked) => setHotkey({ ...hotkey, smart_gestures: checked })} />
       <Field label={t("settings.maxRecording")} hint={t("settings.maxRecordingHint")}>
@@ -262,8 +265,15 @@ function AboutSettings({ settings, locale, t, onSave, onError }: Pick<Props, "se
   );
 }
 
-function HotkeyField({ label, value, locale, t, onChange, optional = false }: { label: string; value: string; locale: Locale; t: TFunc; onChange: (value: string) => void; optional?: boolean }) {
-  return <Field label={label}><Select value={value} onValueChange={onChange}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{optional && <SelectItem value={NONE}>{t("common.none")}</SelectItem>}{HOTKEYS.map((key) => <SelectItem key={key} value={key}>{localizeHotkey(locale, key)}</SelectItem>)}</SelectContent></Select></Field>;
+function HotkeyField({ label, value, locale, t, onChange, optional = false, error }: { label: string; value: string; locale: Locale; t: TFunc; onChange: (value: string) => void; optional?: boolean; error?: string }) {
+  return <Field label={label}><Select value={value} onValueChange={onChange}><SelectTrigger aria-invalid={error ? true : undefined} className={error ? "border-destructive" : undefined}><SelectValue /></SelectTrigger><SelectContent>{optional && <SelectItem value={NONE}>{t("common.none")}</SelectItem>}{hotkeyOptions(value).map((key) => <SelectItem key={key} value={key}>{localizeHotkey(locale, key)}</SelectItem>)}</SelectContent></Select>{error && <span className="mt-1.5 block text-xs leading-relaxed text-destructive" role="alert">{error}</span>}</Field>;
+}
+
+/** The same key bound to two modes makes both hooks fire, so one start always fails. */
+function duplicateHotkey(hotkey: Settings["hotkey"]): string | null {
+  const bound = [hotkey.dictate, hotkey.translate, hotkey.edit_selection]
+    .filter((key): key is string => typeof key === "string" && key.trim() !== "");
+  return bound.find((key, index) => bound.indexOf(key) !== index) ?? null;
 }
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {

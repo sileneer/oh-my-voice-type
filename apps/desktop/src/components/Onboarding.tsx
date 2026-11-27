@@ -4,6 +4,7 @@ import { api, type ApiStatus, type Settings } from "../lib/api";
 import { localizeHotkey, type Locale, type TFunc } from "../i18n";
 import { asrPresets, findAsrPreset, resolvePresetKeyUrl } from "../lib/provider-presets";
 import { cn } from "../lib/utils";
+import { hotkeyOptions } from "../lib/hotkeys";
 import { Button } from "../components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { ReadinessBadge } from "./app/ReadinessBadge";
@@ -11,7 +12,6 @@ import { PermissionList } from "./app/PermissionList";
 import { ApiKeyField } from "./ProviderProfiles";
 import { ModelPicker } from "./ModelPicker";
 
-const HOTKEYS = ["fn", "right-opt", "right-cmd", "right-alt", "right-ctrl", "left-alt", "left-ctrl", "f6", "f7", "f8", "f9", "f10"];
 const steps = ["welcome", "provider", "permission", "hotkey", "finish"] as const;
 
 export default function Onboarding({
@@ -40,6 +40,7 @@ export default function Onboarding({
   const [step, setStep] = useState(0);
   const [hotkey, setHotkey] = useState(settings.hotkey.dictate);
   const [saving, setSaving] = useState(false);
+  const [finishError, setFinishError] = useState<string | null>(null);
 
   // Inline quick ASR setup state for Step 2
   const [presetId, setPresetId] = useState("");
@@ -90,28 +91,26 @@ export default function Onboarding({
     }
   };
 
-  const complete = async () => {
+  // A failed save (e.g. the hotkey could not be installed) used to be an
+  // unhandled rejection: the button re-enabled and nothing explained why.
+  const finishWith = async (next: Settings) => {
     setSaving(true);
+    setFinishError(null);
     try {
-      await onSave({
-        ...settings,
-        hotkey: { ...settings.hotkey, dictate: hotkey },
-        ui: { ...settings.ui, onboarding_completed: true },
-      });
+      await onSave(next);
       onFinish();
+    } catch (error) {
+      setFinishError(String(error));
     } finally {
       setSaving(false);
     }
   };
-  const skip = async () => {
-    setSaving(true);
-    try {
-      await onSave({ ...settings, ui: { ...settings.ui, onboarding_completed: true } });
-      onFinish();
-    } finally {
-      setSaving(false);
-    }
-  };
+  const complete = () => finishWith({
+    ...settings,
+    hotkey: { ...settings.hotkey, dictate: hotkey },
+    ui: { ...settings.ui, onboarding_completed: true },
+  });
+  const skip = () => finishWith({ ...settings, ui: { ...settings.ui, onboarding_completed: true } });
   const current = steps[step];
   const Icon =
     current === "provider"
@@ -300,7 +299,7 @@ export default function Onboarding({
               <Select value={hotkey} onValueChange={setHotkey}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  {HOTKEYS.map((key) => (
+                  {hotkeyOptions(hotkey).map((key) => (
                     <SelectItem key={key} value={key}>{localizeHotkey(locale, key)}</SelectItem>
                   ))}
                 </SelectContent>
@@ -334,6 +333,7 @@ export default function Onboarding({
             </div>
           )}
         </div>
+        {finishError && <p className="mt-4 shrink-0 text-sm text-destructive" role="alert">{finishError}</p>}
         <div className="mt-8 flex shrink-0 items-center justify-between gap-3">
           <Button
             type="button"

@@ -56,7 +56,10 @@ export function DictationPanel({
 
   const active = session === "recording" || session === "starting";
   const busy = session === "processing" || session === "cancelling";
-  const unavailable = apiStatus.asr.state !== "ready" || (mode === "translate" && apiStatus.llm.state !== "ready");
+  // Translation and selection editing are LLM rewrites; the backend refuses to
+  // start either without a ready LLM, so do not offer the button.
+  const needsLlm = mode !== "dictate";
+  const unavailable = apiStatus.asr.state !== "ready" || (needsLlm && apiStatus.llm.state !== "ready");
   const needsSetup = unavailable && session === "idle";
   const status = session === "recording"
     ? t("hotkey.status.listening")
@@ -149,7 +152,7 @@ export function DictationPanel({
         </p>
         <Button type="button" variant="ghost" size="sm" onClick={onOpenHotkeys}>{t("home.changeHotkey")}<ArrowRight className="size-4" aria-hidden="true" /></Button>
       </div>
-      {mode === "translate" && apiStatus.llm.state !== "ready" && <p className="mt-3 text-sm text-warning">{t("home.translateNeedsLlm")}</p>}
+      {needsLlm && apiStatus.llm.state !== "ready" && <p className="mt-3 text-sm text-warning">{t(mode === "translate" ? "home.translateNeedsLlm" : "home.editNeedsLlm")}</p>}
     </section>
   );
 }

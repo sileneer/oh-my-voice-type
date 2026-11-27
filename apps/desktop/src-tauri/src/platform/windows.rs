@@ -12,7 +12,7 @@ use crate::platform::{HotkeyCallback, HotkeyHandle, HotkeyListener, OutputMuteGu
 use ovt_core::hotkey::{Edge, GestureDecoder, HotkeyEvent};
 use ovt_core::Result;
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,9 +42,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, PostThreadMessageW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT,
-    LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, PostThreadMessageW,
+    SetForegroundWindow, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION,
+    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 pub use super::{ContextProvider, TargetInfo, TextInserter};
@@ -409,6 +410,38 @@ fn window_title(hwnd: HWND) -> String {
 
 pub fn is_own_target(target: &TargetInfo) -> bool {
     target.process_id == Some(unsafe { GetCurrentProcessId() })
+}
+
+/// Last foreground window owned by another process (raw HWND value).
+static LAST_EXTERNAL_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
+
+/// Remember which app the user was in. Clicking the tray menu or the main
+/// window's start button makes this process the foreground, and a session must
+/// never type into itself, so those starts hand focus back to this window.
+pub fn start_foreground_tracker() {
+    let _ = std::thread::Builder::new()
+        .name("ovt-foreground".into())
+        .spawn(|| {
+            let own = unsafe { GetCurrentProcessId() };
+            loop {
+                let hwnd = unsafe { GetForegroundWindow() };
+                if !hwnd.0.is_null() && foreground_pid(hwnd).is_some_and(|pid| pid != own) {
+                    LAST_EXTERNAL_FOREGROUND.store(hwnd.0 as isize, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+}
+
+/// Bring back the last external app. Allowed by Windows' foreground lock
+/// because this process currently owns the foreground.
+pub fn focus_previous_app() -> bool {
+    let raw = LAST_EXTERNAL_FOREGROUND.load(Ordering::Relaxed);
+    if raw == 0 {
+        return false;
+    }
+    let hwnd = HWND(raw as *mut std::ffi::c_void);
+    unsafe { IsWindow(Some(hwnd)).as_bool() && SetForegroundWindow(hwnd).as_bool() }
 }
 
 pub fn foreground_work_area() -> Option<(i32, i32, i32, i32)> {

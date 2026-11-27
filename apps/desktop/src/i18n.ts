@@ -262,6 +262,7 @@ const en = {
   "home.openRecovery": "Review recovery",
   "home.editNeedsSelection": "Select text in another app before editing a selection.",
   "home.translateNeedsLlm": "Translation requires a working LLM provider.",
+  "home.editNeedsLlm": "Editing a selection requires a working LLM provider.",
 
   "history.title": "History and recovery",
   "history.subtitle": "Search local transcripts and recover interrupted sessions without inserting them automatically.",
@@ -301,6 +302,9 @@ const en = {
   "history.pendingCopy": "Copy result",
   "history.pendingDiscard": "Discard",
   "history.pendingStage": "Stage: {stage}",
+  "history.pendingNoAudio": "The recording is missing, so this session cannot be retried. Discard it.",
+  "history.pendingRetried": "Recovered — the result is now in your history.",
+  "history.audioExported": "Audio exported.",
 
   "settings.general": "General",
   "settings.group.appearance": "Appearance",
@@ -328,6 +332,7 @@ const en = {
   "settings.defaultMode": "Default mode",
   "settings.defaultTone": "Default tone",
   "settings.translateHotkey": "Translation hotkey",
+  "settings.hotkeyDuplicate": "{key} is already used by another mode.",
   "settings.editHotkey": "Edit selection hotkey",
   "settings.translationTarget": "Default translation language",
   "settings.appContext": "Include app name and window title",
@@ -656,6 +661,7 @@ const zhCN: Record<MessageKey, string> = {
   "home.openRecovery": "查看恢复任务",
   "home.editNeedsSelection": "请先在另一个应用中选择需要编辑的文本。",
   "home.translateNeedsLlm": "翻译需要可用的 LLM 服务商。",
+  "home.editNeedsLlm": "编辑选区需要可用的 LLM 服务商。",
 
   "history.title": "历史与恢复",
   "history.subtitle": "搜索本地转录记录，恢复中断任务，但不会自动插入到其他应用。",
@@ -695,6 +701,9 @@ const zhCN: Record<MessageKey, string> = {
   "history.pendingCopy": "复制结果",
   "history.pendingDiscard": "丢弃",
   "history.pendingStage": "阶段：{stage}",
+  "history.pendingNoAudio": "录音已丢失，无法重试此会话，请丢弃。",
+  "history.pendingRetried": "已恢复，结果已保存到历史记录。",
+  "history.audioExported": "音频已导出。",
 
   "settings.general": "常规",
   "settings.group.appearance": "外观",
@@ -722,6 +731,7 @@ const zhCN: Record<MessageKey, string> = {
   "settings.defaultMode": "默认模式",
   "settings.defaultTone": "默认语气",
   "settings.translateHotkey": "翻译快捷键",
+  "settings.hotkeyDuplicate": "{key} 已被其他模式使用。",
   "settings.editHotkey": "编辑选区快捷键",
   "settings.translationTarget": "默认翻译语言",
   "settings.appContext": "包含应用名称和窗口标题",

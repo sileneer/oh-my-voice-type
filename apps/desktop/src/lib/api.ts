@@ -150,6 +150,8 @@ export interface HistoryQuery {
   pinned?: boolean | null;
   from_ms?: number | null;
   to_ms?: number | null;
+  /** Strict newest-first order instead of pinned entries first. */
+  newest_first?: boolean;
 }
 
 export interface SessionRequest {
@@ -234,14 +236,27 @@ export const api = {
   cancel: () => invoke<void>("dictation_cancel"),
   pillHide: () => invoke<void>("pill_hide"),
   sessionStart: (request: SessionRequest) => invoke<{ session_id: string }>("session_start", { request }),
+  // Tauri 2 maps every Rust command parameter to a camelCase key; snake_case
+  // keys are silently ignored (optional) or rejected (required). Struct-typed
+  // parameters (`settings`, `request`, `args`) keep their serde field names.
   historyList: (query: HistoryQuery) =>
-    invoke<HistoryPage>("history_list", { ...query }),
+    invoke<HistoryPage>("history_list", {
+      limit: query.limit,
+      offset: query.offset,
+      query: query.query,
+      mode: query.mode,
+      delivery: query.delivery,
+      pinned: query.pinned,
+      fromMs: query.from_ms,
+      toMs: query.to_ms,
+      newestFirst: query.newest_first,
+    }),
   historyDelete: (id: string) => invoke<void>("history_delete", { id }),
   historyDeleteAll: () => invoke<void>("history_delete_all"),
   historyPin: (id: string, pinned: boolean) =>
     invoke<void>("history_set_pinned", { id, pinned }),
   historyReprocess: (id: string, mode: Mode, targetLanguage?: string | null) =>
-    invoke<HistoryEntry>("history_reprocess", { id, mode, target_language: targetLanguage ?? null }),
+    invoke<HistoryEntry>("history_reprocess", { id, mode, targetLanguage: targetLanguage ?? null }),
   historyExportAudio: (id: string) => invoke<boolean>("history_export_audio", { id }),
   pendingList: () => invoke<PendingRecord[]>("pending_list"),
   pendingRetry: (id: string) => invoke<PendingRecord>("pending_retry", { id }),
@@ -251,7 +266,7 @@ export const api = {
   dictionaryList: () => invoke<DictionaryEntry[]>("dictionary_list"),
   dictionaryAdd: (term: string) => invoke<DictionaryEntry[]>("dictionary_add", { term }),
   dictionaryRename: (oldTerm: string, newTerm: string) =>
-    invoke<DictionaryEntry[]>("dictionary_rename", { old_term: oldTerm, new_term: newTerm }),
+    invoke<DictionaryEntry[]>("dictionary_rename", { oldTerm, newTerm }),
   dictionaryRemove: (term: string) => invoke<DictionaryEntry[]>("dictionary_remove", { term }),
   updaterStatus: () => invoke<UpdaterSnapshot>("updater_status"),
   updaterCheck: () => invoke<UpdaterSnapshot>("updater_check"),

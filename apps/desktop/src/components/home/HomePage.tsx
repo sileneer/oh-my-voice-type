@@ -52,7 +52,8 @@ export function HomePage({
   const [refreshing, setRefreshing] = useState(false);
   const loadRecent = useCallback(async () => {
     try {
-      const page = await api.historyList({ limit: 3, offset: 0 });
+      // Newest first: pinned-first ordering showed old pinned items as "recent".
+      const page = await api.historyList({ limit: 3, offset: 0, newest_first: true });
       setRecent(page.entries);
     } catch {
       setRecent([]);
@@ -105,7 +106,7 @@ export function HomePage({
             <ul className="mt-3 divide-y divide-border">
               {recent.map((entry) => (
                 <li key={entry.id} className="py-3">
-                  <p className="line-clamp-2 text-sm leading-relaxed text-secondary-foreground">{entry.final_text}</p>
+                  <p className="line-clamp-2 text-sm leading-relaxed text-secondary-foreground">{entry.final_text || entry.raw_text}</p>
                   <p className="mt-1 text-xs text-muted-foreground">{formatWhen(entry.created_at_ms, locale)}{entry.app_name ? ` · ${entry.app_name}` : ""}</p>
                 </li>
               ))}

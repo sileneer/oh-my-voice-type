@@ -104,13 +104,15 @@ export function installTauriMock() {
         const mode = typeof args.mode === "string" ? args.mode : null;
         const delivery = typeof args.delivery === "string" ? args.delivery : null;
         const pinned = args.pinned === true;
-        const from = typeof args.from_ms === "number" ? args.from_ms : 0;
-        const to = typeof args.to_ms === "number" ? args.to_ms : Number.MAX_SAFE_INTEGER;
+        // Read the camelCase keys the real Tauri bridge expects, so a
+        // snake_case regression fails here instead of only in the app.
+        const from = typeof args.fromMs === "number" ? args.fromMs : 0;
+        const to = typeof args.toMs === "number" ? args.toMs : Number.MAX_SAFE_INTEGER;
         const filtered = activeHistory.filter((entry) =>
           (!query || entry.final_text.toLowerCase().includes(query) || entry.raw_text.toLowerCase().includes(query)) &&
           (!mode || entry.mode === mode) && (!delivery || entry.delivery_status === delivery) &&
           (!pinned || entry.pinned) && entry.created_at_ms >= from && entry.created_at_ms <= to,
-        ).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.created_at_ms - a.created_at_ms);
+        ).sort((a, b) => (args.newestFirst === true ? 0 : Number(b.pinned) - Number(a.pinned)) || b.created_at_ms - a.created_at_ms);
         return { entries: structuredClone(filtered.slice(offset, offset + limit)), total: filtered.length };
       }
       case "history_delete": activeHistory.splice(activeHistory.findIndex((entry) => entry.id === args.id), 1); return undefined;
@@ -145,7 +147,9 @@ export function installTauriMock() {
       case "pill_hide": return undefined;
       case "dictionary_list": return [{ term: "Qoder" }, { term: "WebView2" }, { term: "standby power" }];
       case "dictionary_add": return [{ term: String(args.term) }];
-      case "dictionary_rename": return [{ term: String(args.new_term) }];
+      case "dictionary_rename":
+        if (typeof args.oldTerm !== "string" || typeof args.newTerm !== "string") throw new Error("command dictionary_rename missing required key oldTerm/newTerm");
+        return [{ term: args.newTerm }];
       case "dictionary_remove": return [];
       case "updater_status": return { status: "idle", current_version: "0.1.0", update: null, progress: null, message: null, checked_at_ms: null };
       case "updater_check": return params.get("update") === "1"

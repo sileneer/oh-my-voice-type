@@ -47,6 +47,8 @@ pub struct HistoryFilter {
     pub to_ms: Option<u64>,
     pub limit: u32,
     pub offset: u32,
+    /// Strict newest-first order (e.g. a "recent" list) instead of pinned first.
+    pub newest_first: bool,
 }
 
 pub struct HistoryRepo {
@@ -217,9 +219,13 @@ impl HistoryRepo {
         )? as u64;
         values.push((filter.limit.clamp(1, 200) as i64).into());
         values.push(filter.offset.into());
-        let sql = format!(
-            "SELECT {COLUMNS} FROM history{where_sql} ORDER BY pinned DESC, created_at_ms DESC LIMIT ? OFFSET ?"
-        );
+        let order = if filter.newest_first {
+            "created_at_ms DESC"
+        } else {
+            "pinned DESC, created_at_ms DESC"
+        };
+        let sql =
+            format!("SELECT {COLUMNS} FROM history{where_sql} ORDER BY {order} LIMIT ? OFFSET ?");
         let mut stmt = conn.prepare(&sql)?;
         let entries = stmt
             .query_map(params_from_iter(values.iter()), row_to_entry)?
@@ -378,6 +384,17 @@ mod tests {
         repo.set_pinned("a", true).unwrap();
         let page = repo.list(10, 0, None).unwrap();
         assert_eq!(page.entries[0].id, "a");
+        let recent = repo
+            .list_filtered(&HistoryFilter {
+                limit: 1,
+                newest_first: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            recent.entries[0].id, "b",
+            "a pinned old entry is not recent"
+        );
         repo.delete("a").unwrap();
         assert_eq!(repo.count().unwrap(), 1);
     }

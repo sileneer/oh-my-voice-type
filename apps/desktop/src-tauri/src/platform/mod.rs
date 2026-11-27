@@ -220,6 +220,39 @@ pub fn is_own_target(target: &TargetInfo) -> bool {
 }
 
 /// Physical work area `(x, y, width, height)` of the target's display.
+pub fn start_foreground_tracker() {
+    #[cfg(target_os = "windows")]
+    windows::start_foreground_tracker();
+}
+
+/// A start from this app's own UI (main-window button, tray menu) finds this
+/// app in the foreground, and sessions never type into themselves, so those
+/// starts used to fail every time. Hand the foreground back to the app the user
+/// was in and give it a moment to settle. Blocking; call off the main thread.
+pub fn yield_focus_to_previous_app(app: &tauri::AppHandle, own_foreground: bool) {
+    if !own_foreground {
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use tauri::Manager;
+        if let Some(main) = app.get_webview_window("main") {
+            if main.is_focused().unwrap_or(false) {
+                let _ = main.minimize();
+            }
+        }
+        windows::focus_previous_app();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Hiding the app activates the previously frontmost one.
+        let _ = app.hide();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let _ = app;
+    std::thread::sleep(std::time::Duration::from_millis(350));
+}
+
 pub fn target_work_area() -> Option<(i32, i32, i32, i32)> {
     #[cfg(target_os = "windows")]
     {

@@ -58,8 +58,15 @@ pub fn set_settings(
     state: State<'_, AppState>,
     settings: Settings,
 ) -> Result<Settings, String> {
+    let previous = state.config.snapshot()?;
     let saved = state.config.save_general(settings)?;
-    dictation::reload_hotkey(&app).map_err(|e| e.to_string())?;
+    if let Err(error) = dictation::reload_hotkey(&app) {
+        // Keep a working hotkey: an unbindable key used to stay saved, so the
+        // app had no hotkey now and failed again on every launch.
+        let _ = state.config.save_general(previous);
+        let _ = dictation::reload_hotkey(&app);
+        return Err(format!("hotkey not saved: {error}"));
+    }
     if let Some(history) = &state.history {
         if let Ok(paths) =
             history.prune_with_audio(&saved.history, ovt_core::dictation::unix_now_ms())
@@ -88,12 +95,23 @@ pub fn dictation_toggle(app: AppHandle) -> Result<(), String> {
     dictation::toggle(&app).map_err(|e| e.to_string())
 }
 
+/// Start from the main window's button. That click makes this app the
+/// foreground target, which `start` (rightly) refuses to type into, so the
+/// button could never work: step aside first so focus returns to the app the
+/// user was in, then capture it. Runs off the main thread because `start`
+/// blocks and minimizing needs the event loop.
 #[tauri::command]
-pub fn session_start(
+pub async fn session_start(
     app: AppHandle,
     request: dictation::SessionRequest,
 ) -> Result<dictation::SessionStarted, String> {
-    dictation::start(&app, request).map_err(|e| e.to_string())
+    let app_for_start = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        dictation::start_from_own_ui(&app_for_start, request)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -137,6 +155,7 @@ pub fn history_list(
     pinned: Option<bool>,
     from_ms: Option<u64>,
     to_ms: Option<u64>,
+    newest_first: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let Some(repo) = &state.history else {
         return Ok(serde_json::json!({"entries": [], "total": 0}));
@@ -151,6 +170,7 @@ pub fn history_list(
             to_ms,
             limit,
             offset,
+            newest_first: newest_first.unwrap_or(false),
         })
         .map_err(|e| e.to_string())?;
     serde_json::to_value(page).map_err(|e| e.to_string())
@@ -270,7 +290,7 @@ pub async fn history_reprocess(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn history_export_audio(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -531,7 +551,10 @@ pub fn set_active_profile(
     state.config.set_active_profile(role, id)
 }
 
-#[tauri::command]
+// Commands that open a blocking file dialog must not run on the main thread
+// (where plain sync commands run): the dialog needs the main event loop, so the
+// app froze. `async` moves them onto the runtime's worker threads.
+#[tauri::command(async)]
 pub fn export_config(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
     use tauri_plugin_dialog::DialogExt;
     let Some(file) = app
@@ -547,7 +570,7 @@ pub fn export_config(app: AppHandle, state: State<'_, AppState>) -> Result<bool,
     Ok(true)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn import_config(
     app: AppHandle,
     state: State<'_, AppState>,
