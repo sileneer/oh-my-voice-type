@@ -21,12 +21,12 @@ serde_json = "1"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 ovt-core = { path = "../../../crates/ovt-core" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-cpal = "0.15"
+cpal = "0.18"
 arboard = "3"
-dirs = "6"
+dirs = "7"
 reqwest = { version = "0.12", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
@@ -34,7 +34,7 @@ keyring = { version = "3", features = ["apple-native", "windows-native"] }
 tauri-plugin-updater = "2.14.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.59", features = [
+windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_UI_WindowsAndMessaging",
@@ -67,7 +67,7 @@ objc2-app-kit = { version = "0.3", features = [
   "libc",
 ] }
 core-foundation = "0.10"
-core-graphics = "0.24"
+core-graphics = "0.25"
 objc2-core-foundation = "0.3"
 
 [dev-dependencies]
