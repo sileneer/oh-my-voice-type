@@ -471,6 +471,19 @@ async fn run_session_inner(
             return Err(ovt_core::Error::Cancelled);
         }
         let state = app_for_insert.state::<commands::AppState>();
+        // Stopping from the tray menu, the HUD or the main window makes this
+        // app the foreground, so the target check failed and the text was only
+        // copied. Hand focus back to the captured target in that case; a
+        // switch to a different app is still refused.
+        if state
+            .inserters
+            .context
+            .capture()
+            .is_ok_and(|now| platform::is_own_target(&now))
+            && platform::focus_target(&expected_target)
+        {
+            std::thread::sleep(Duration::from_millis(150));
+        }
         let current = state.inserters.context.verify_target(&expected_target)?;
         if platform::is_own_target(&current) {
             return Err(ovt_core::Error::Insert(

@@ -220,6 +220,22 @@ pub fn is_own_target(target: &TargetInfo) -> bool {
 }
 
 /// Physical work area `(x, y, width, height)` of the target's display.
+/// Bring the session's captured target window back to the foreground. Only
+/// meaningful while this app owns the foreground (Windows' foreground lock).
+pub fn focus_target(target: &TargetInfo) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows::focus_target(target)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // macOS: status-item menus and the non-activating pill do not take
+        // the frontmost-app role, so the target is still frontmost.
+        let _ = target;
+        false
+    }
+}
+
 pub fn start_foreground_tracker() {
     #[cfg(target_os = "windows")]
     windows::start_foreground_tracker();

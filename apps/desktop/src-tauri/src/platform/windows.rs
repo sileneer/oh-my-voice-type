@@ -539,6 +539,28 @@ fn window_class(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..(n.max(0) as usize).min(buf.len())])
 }
 
+/// Re-activate the window a session captured (`stable_target_id` is
+/// "pid:hwnd"), if it still exists and still belongs to that process.
+pub fn focus_target(target: &TargetInfo) -> bool {
+    let Some((pid, raw)) = target
+        .stable_target_id
+        .as_deref()
+        .and_then(|id| id.split_once(':'))
+        .and_then(|(pid, hwnd)| Some((pid.parse::<u32>().ok()?, hwnd.parse::<isize>().ok()?)))
+    else {
+        return false;
+    };
+    if raw == 0 {
+        return false;
+    }
+    let hwnd = HWND(raw as *mut std::ffi::c_void);
+    unsafe {
+        IsWindow(Some(hwnd)).as_bool()
+            && foreground_pid(hwnd) == Some(pid)
+            && SetForegroundWindow(hwnd).as_bool()
+    }
+}
+
 /// Bring back the last external app. Allowed by Windows' foreground lock
 /// because this process currently owns the foreground.
 pub fn focus_previous_app() -> bool {
@@ -929,6 +951,19 @@ mod tests {
         assert!(!is_ignored_hook_event(&event(0xA2, 0x1D, 0)));
         assert!(!is_ignored_hook_event(&event(0x41, 0x1E, 0)));
         assert!(is_alt_vk(0xA5) && is_alt_vk(0xA4) && !is_alt_vk(0xA3));
+    }
+
+    #[test]
+    fn focus_target_refuses_unusable_target_ids() {
+        let target = |id: Option<&str>| TargetInfo {
+            stable_target_id: id.map(str::to_string),
+            ..TargetInfo::default()
+        };
+        assert!(!focus_target(&target(None)));
+        assert!(!focus_target(&target(Some("not-an-id"))));
+        assert!(!focus_target(&target(Some("1234:0"))));
+        // A handle that is no window at all is never activated.
+        assert!(!focus_target(&target(Some("1234:1"))));
     }
 
     #[test]
