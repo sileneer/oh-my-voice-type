@@ -26,6 +26,9 @@ export default function App() {
   const [pendingCount, setPendingCount] = useState(0);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [onboardingDismissed, setOnboardingDismissed] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<{ id: string; nonce: number } | null>(null);
+  const localeRef = useRef<string | undefined>(undefined);
+  localeRef.current = settings?.ui.locale;
   const activeSessionId = useRef<string | null>(null);
 
   useTheme(settings?.ui.theme);
@@ -50,6 +53,10 @@ export default function App() {
     setTab(next);
     window.requestAnimationFrame(() => document.querySelector<HTMLElement>("h1")?.focus());
   }, []);
+  const openSettings = useCallback((section: string) => {
+    navigate("settings");
+    setSettingsSection({ id: section, nonce: Date.now() });
+  }, [navigate]);
 
   useEffect(() => {
     void refreshSettings().catch((cause) => setLoadError(String(cause)));
@@ -80,11 +87,22 @@ export default function App() {
     void events.onSessionLevel((value) => setLevel(value)).then((u) => unlisteners.push(u));
     void events.onSessionOutcome(() => { activeSessionId.current = null; setLevel(0); void refreshPending(); }).then((u) => unlisteners.push(u));
     void events.onPendingChanged(() => void refreshPending()).then((u) => unlisteners.push(u));
-    void events.onAppNavigate(({ tab: next }) => {
+    void events.onAppNavigate(({ tab: next, section }) => {
       if (next === "home" || next === "history" || next === "settings") navigate(next);
+      if (next === "settings" && section) setSettingsSection({ id: section, nonce: Date.now() });
+    }).then((u) => unlisteners.push(u));
+    void events.onUpdaterAvailable((update) => {
+      const t = makeT(resolveLocale(localeRef.current));
+      toast.info(t("settings.updateToast", { version: update.version }), {
+        duration: 15000,
+        action: {
+          label: t("settings.updateToastAction"),
+          onClick: () => openSettings("about"),
+        },
+      });
     }).then((u) => unlisteners.push(u));
     return () => unlisteners.forEach((u) => u());
-  }, [navigate, refreshPending]);
+  }, [navigate, openSettings, refreshPending]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -131,6 +149,9 @@ export default function App() {
   const t = makeT(locale);
   const showOnboarding = settings.ui.onboarding_completed === false && !onboardingDismissed;
 
+  const activeAsrLabel = settings.asr_profiles.find((p) => p.id === settings.active_asr_profile_id)?.label;
+  const activeLlmLabel = settings.llm_profiles.find((p) => p.id === settings.active_llm_profile_id)?.label;
+
   return (
     <>
       {showOnboarding ? (
@@ -140,16 +161,26 @@ export default function App() {
           apiStatus={apiStatus}
           locale={locale}
           t={t}
-          onOpenSettings={() => { setOnboardingDismissed(true); navigate("settings"); }}
+          onOpenSettings={() => { setOnboardingDismissed(true); openSettings("providers"); }}
           onRefreshPermissions={() => void refreshPermissions()}
+          onChanged={async () => { await refreshSettings(); await refreshStatus(); }}
           onSave={saveSettings}
           onFinish={() => setOnboardingDismissed(true)}
         />
       ) : (
-        <AppShell tab={tab} apiStatus={apiStatus} pendingCount={pendingCount} t={t} onNavigate={navigate}>
-          {tab === "home" && <HomePage settings={settings} apiStatus={apiStatus} permissions={permissions} session={session} mode={mode} targetLanguage={targetLanguage} level={level} pendingCount={pendingCount} locale={locale} t={t} onOpenSettings={() => navigate("settings")} onOpenHistory={() => navigate("history")} onModeChange={setMode} onTargetChange={setTargetLanguage} onStart={() => void startSession()} onCancel={() => void cancelSession()} onSave={saveSettings} onRefreshPermissions={refreshPermissions} onError={(message) => toast.error(message)} />}
-          {tab === "history" && <HistoryList locale={locale} t={t} />}
-          {tab === "settings" && <SettingsPanel settings={settings} apiStatus={apiStatus} t={t} locale={locale} onSave={saveSettings} onError={(message) => toast.error(message)} onChanged={refreshSettings} onApiStatusChanged={refreshStatus} />}
+        <AppShell
+          tab={tab}
+          apiStatus={apiStatus}
+          activeAsrLabel={activeAsrLabel}
+          activeLlmLabel={activeLlmLabel}
+          pendingCount={pendingCount}
+          t={t}
+          onNavigate={navigate}
+          onOpenProviders={() => openSettings("providers")}
+        >
+          {tab === "home" && <HomePage settings={settings} apiStatus={apiStatus} permissions={permissions} session={session} mode={mode} targetLanguage={targetLanguage} level={level} pendingCount={pendingCount} locale={locale} t={t} onOpenSettings={() => openSettings("providers")} onOpenHistory={() => navigate("history")} onModeChange={setMode} onTargetChange={setTargetLanguage} onStart={() => void startSession()} onCancel={() => void cancelSession()} onOpenHotkeys={() => openSettings("modes")} onRefreshPermissions={refreshPermissions} />}
+          {tab === "history" && <HistoryList locale={locale} t={t} hotkey={settings.hotkey.dictate} />}
+          {tab === "settings" && <SettingsPanel settings={settings} apiStatus={apiStatus} t={t} locale={locale} onSave={saveSettings} onError={(message) => toast.error(message)} onChanged={refreshSettings} onApiStatusChanged={refreshStatus} section={settingsSection} />}
         </AppShell>
       )}
       <Toaster theme={normalizeThemePreference(settings.ui.theme)} position="bottom-right" richColors closeButton />

@@ -10,13 +10,13 @@
 use crate::platform::{HotkeyCallback, HotkeyHandle, HotkeyListener};
 use ovt_core::hotkey::{Edge, GestureDecoder};
 use ovt_core::Result;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use core_foundation::base::{CFRelease, CFStringRef, CFTypeRef, TCFType};
-use core_foundation::runloop::CFRunLoopSource;
-use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop, CFRunLoopSourceRef};
+use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_foundation::string::CFString;
 use core_graphics::event::{
     CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -28,7 +28,7 @@ pub use super::{ContextProvider, TargetInfo, TextInserter};
 static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_session_active(active: bool) {
-    SESSION_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
+    SESSION_ACTIVE.store(active, Ordering::SeqCst);
 }
 
 pub fn is_own_target(target: &TargetInfo) -> bool {
@@ -37,16 +37,17 @@ pub fn is_own_target(target: &TargetInfo) -> bool {
 
 pub fn foreground_work_area() -> Option<(i32, i32, i32, i32)> {
     use objc2_app_kit::NSScreen;
-    unsafe {
-        let screen = NSScreen::mainScreen()?;
-        let frame = screen.visibleFrame();
-        Some((
-            frame.origin.x as i32,
-            frame.origin.y as i32,
-            frame.size.width as i32,
-            frame.size.height as i32,
-        ))
-    }
+    use objc2_foundation::MainThreadMarker;
+
+    let mtm = MainThreadMarker::new()?;
+    let screen = NSScreen::mainScreen(mtm)?;
+    let frame = screen.visibleFrame();
+    Some((
+        frame.origin.x as i32,
+        frame.origin.y as i32,
+        frame.size.width as i32,
+        frame.size.height as i32,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -80,21 +81,15 @@ pub fn accessibility_trusted() -> bool {
 
 pub fn input_monitoring_trusted() -> bool {
     // CGEventTap creation succeeds only when an Input Monitoring-capable
-    // process can install a tap; probe with an own-process session tap.
-    let probe = CGEventTap::new(
+    // process can install a tap; probe with a passive tap.
+    CGEventTap::new(
         CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
-        CGEventTapOptions::Defaults,
-        vec![CGEventType::FlagChanged],
-        |_proxy, _ty, _ev| core_foundation::runloop::CFRunLoopStatus::Keep,
-    );
-    match probe {
-        Ok(mut tap) => match tap.mach_port() {
-            Ok(_) => true,
-            Err(_) => false,
-        },
-        Err(_) => false,
-    }
+        CGEventTapOptions::ListenOnly,
+        vec![CGEventType::FlagsChanged],
+        |_proxy, _ty, _ev| None,
+    )
+    .is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -176,15 +171,15 @@ impl ContextProvider for MacContext {
     fn target(&self) -> TargetInfo {
         use objc2_app_kit::NSWorkspace;
 
-        let workspace = unsafe { NSWorkspace::sharedWorkspace() };
+        let workspace = NSWorkspace::sharedWorkspace();
         let mut info = TargetInfo::default();
-        unsafe {
-            if let Some(app) = workspace.frontmostApplication() {
-                info.process_id = Some(app.processIdentifier());
-                info.stable_target_id = Some(format!("{}:frontmost", info.process_id.unwrap_or(0)));
-                if let Some(name) = app.localizedName() {
-                    info.app_name = Some(name.to_string());
-                }
+        if let Some(app) = workspace.frontmostApplication() {
+            if let Ok(pid) = u32::try_from(app.processIdentifier()) {
+                info.process_id = Some(pid);
+                info.stable_target_id = Some(format!("{pid}:frontmost"));
+            }
+            if let Some(name) = app.localizedName() {
+                info.app_name = Some(name.to_string());
             }
         }
         info.accessibility_ok = accessibility_trusted();
@@ -198,9 +193,12 @@ impl ContextProvider for MacContext {
             ));
         }
         let mut info = self.target();
-        let pid = info.process_id.ok_or_else(|| {
-            ovt_core::Error::Unsupported("the frontmost application is unavailable".into())
-        })?;
+        let pid = info
+            .process_id
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| {
+                ovt_core::Error::Unsupported("the frontmost application is unavailable".into())
+            })?;
         unsafe {
             let application = AXUIElementCreateApplication(pid);
             if application.is_null() {
@@ -251,9 +249,12 @@ impl ContextProvider for MacContext {
                 "the target selection changed before replacement".into(),
             ));
         }
-        let pid = current.process_id.ok_or_else(|| {
-            ovt_core::Error::Unsupported("the frontmost application is unavailable".into())
-        })?;
+        let pid = current
+            .process_id
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| {
+                ovt_core::Error::Unsupported("the frontmost application is unavailable".into())
+            })?;
         unsafe {
             let application = AXUIElementCreateApplication(pid);
             if application.is_null() {
@@ -318,12 +319,10 @@ unsafe fn ax_string(element: AXUIElementRef, name: &str) -> Option<String> {
 
 pub struct MacHookHandle {
     run_loop: CFRunLoop,
-    stop: Arc<Mutex<bool>>,
 }
 
 impl HotkeyHandle for MacHookHandle {
     fn stop(&mut self) {
-        *self.stop.lock().unwrap() = true;
         self.run_loop.stop();
     }
 }
@@ -345,81 +344,100 @@ impl HotkeyListener for MacHotkey {
         callback: HotkeyCallback,
     ) -> Result<Box<dyn HotkeyHandle + Send + Sync>> {
         let mask = flags_mask_for(key)?;
-        let smart_decoder = Arc::new(Mutex::new(GestureDecoder::new(
-            Duration::from_millis(350),
-            smart,
-        )));
-        let callback = Arc::new(callback);
-        let decoder = smart_decoder.clone();
-        let cb = callback.clone();
+        let (tx, rx) = sync_channel::<Result<CFRunLoop>>(1);
 
-        let tap = CGEventTap::new(
-            CGEventTapLocation::HID,
-            CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::Defaults,
-            vec![
-                CGEventType::FlagsChanged,
-                CGEventType::KeyDown,
-                CGEventType::KeyUp,
-            ],
-            move |_proxy, kind, event| {
-                use core_foundation::runloop::CFRunLoopStatus;
-                let flags = event.get_flags();
-                let mut d = decoder.lock().unwrap();
-                if kind == CGEventType::KeyDown
-                    && event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) == 53
-                    && SESSION_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    d.reset();
-                    cb(ovt_core::hotkey::HotkeyEvent::Cancel);
-                    return core_foundation::runloop::CFRunLoopStatus::Keep;
-                }
-                match kind {
-                    CGEventType::FlagsChanged => {
-                        let down = flags.contains(mask);
-                        // Detect edge from decoder-tracked state (host OS gives
-                        // no per-key edge for modifiers).
-                        let edge = match &mut *d {
-                            dec => dec.edge_from_flag(down),
-                        };
-                        if let Some(edge) = edge {
-                            if let Some(ev) = d.on_edge(edge, std::time::Instant::now()) {
-                                cb(ev);
-                            }
-                        }
-                    }
-                    _ => {
-                        if flags.contains(mask) {
-                            // other key pressed while activation modifier held
-                            if let Some(ev) = d.note_other_key() {
-                                cb(ev);
-                            }
-                        }
-                    }
-                }
-                // Do not swallow: chords must keep reaching the target app.
-                CFRunLoopStatus::Keep
-            },
-        )
-        .map_err(|_| {
-            ovt_core::Error::Unsupported(
-                "CGEventTap failed: grant Input Monitoring/Accessibility in System Settings".into(),
-            )
-        })?;
-
-        let source = tap
-            .mach_port()
-            .map_err(|_| ovt_core::Error::Unsupported("CGEventTap port failed".into()))?;
-        let source = CFRunLoopSource::from_binary(source);
-        let run_loop = CFRunLoop::get_current();
-        run_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
-        let stop = Arc::new(Mutex::new(false));
-        let run_loop_clone = run_loop.clone();
-        // The tap must be pumped on a dedicated thread run loop.
+        // The tap and its CFRunLoop must live on the same dedicated thread so
+        // the tap stays alive for the duration of the run loop.
         std::thread::spawn(move || {
-            let _ = run_loop_clone.run();
+            let decoder = Arc::new(Mutex::new((
+                GestureDecoder::new(Duration::from_millis(350), smart),
+                false,
+            )));
+            let cb = Arc::new(callback);
+
+            let tap = match CGEventTap::new(
+                CGEventTapLocation::HID,
+                CGEventTapPlacement::HeadInsertEventTap,
+                CGEventTapOptions::ListenOnly,
+                vec![
+                    CGEventType::FlagsChanged,
+                    CGEventType::KeyDown,
+                    CGEventType::KeyUp,
+                ],
+                move |_proxy, kind, event| {
+                    let flags = event.get_flags();
+                    let mut state = decoder.lock().unwrap();
+                    let (ref mut d, ref mut was_down) = *state;
+                    if matches!(kind, CGEventType::KeyDown)
+                        && event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) == 53
+                        && SESSION_ACTIVE.load(Ordering::SeqCst)
+                    {
+                        d.reset();
+                        *was_down = false;
+                        cb(ovt_core::hotkey::HotkeyEvent::Cancel);
+                        return None;
+                    }
+                    match kind {
+                        CGEventType::FlagsChanged => {
+                            let down = flags.contains(mask);
+                            let edge = match (down, *was_down) {
+                                (true, false) => Some(Edge::Down),
+                                (false, true) => Some(Edge::Up),
+                                _ => None,
+                            };
+                            *was_down = down;
+                            if let Some(edge) = edge {
+                                if let Some(ev) = d.on_edge(edge, std::time::Instant::now()) {
+                                    cb(ev);
+                                }
+                            }
+                        }
+                        _ => {
+                            if flags.contains(mask) {
+                                // other key pressed while activation modifier held
+                                if let Some(ev) = d.note_other_key() {
+                                    cb(ev);
+                                }
+                            }
+                        }
+                    }
+                    // Do not swallow: chords must keep reaching the target app.
+                    None
+                },
+            ) {
+                Ok(tap) => tap,
+                Err(()) => {
+                    let _ = tx.send(Err(ovt_core::Error::Unsupported(
+                        "CGEventTap failed: grant Input Monitoring/Accessibility in System Settings"
+                            .into(),
+                    )));
+                    return;
+                }
+            };
+
+            let source = match tap.mach_port.create_runloop_source(0) {
+                Ok(source) => source,
+                Err(()) => {
+                    let _ = tx.send(Err(ovt_core::Error::Unsupported(
+                        "CGEventTap run loop source failed".into(),
+                    )));
+                    return;
+                }
+            };
+            let run_loop = CFRunLoop::get_current();
+            run_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
+            tap.enable();
+            let _ = tx.send(Ok(run_loop));
+            CFRunLoop::run_current();
+            // Keep `tap` and `source` alive until the run loop stops.
+            drop(source);
+            drop(tap);
         });
-        Ok(Box::new(MacHookHandle { run_loop, stop }))
+
+        let run_loop = rx
+            .recv()
+            .map_err(|_| ovt_core::Error::Unsupported("CGEventTap thread exited early".into()))??;
+        Ok(Box::new(MacHookHandle { run_loop }))
     }
 }
 
@@ -439,16 +457,4 @@ fn flags_mask_for(key: &str) -> Result<CGEventFlags> {
             )))
         }
     })
-}
-
-// Minimal helper to expose flag-edge state on the decoder for modifier keys.
-impl GestureDecoder {
-    fn edge_from_flag(&mut self, down: bool) -> Option<Edge> {
-        let was_down = !self.is_idle();
-        match (down, was_down) {
-            (true, false) => Some(Edge::Down),
-            (false, true) => Some(Edge::Up),
-            _ => None,
-        }
-    }
 }

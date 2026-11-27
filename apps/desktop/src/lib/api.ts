@@ -10,7 +10,6 @@ export interface AppTone {
 }
 
 export type ProfileRole = "asr" | "llm";
-export type CredentialRole = ProfileRole | "both";
 export type ReadinessState =
   | "ready"
   | "missing_profile"
@@ -25,7 +24,9 @@ export interface AsrProfile {
   base_url: string | null;
   model: string | null;
   extra_options: [string, string][];
+  preset: string | null;
   credential_id: string | null;
+  credential_hint: string | null;
   allow_insecure_http: boolean;
 }
 
@@ -36,17 +37,10 @@ export interface LlmProfile {
   format: "open_ai_chat" | "open_ai_responses" | "anthropic_messages";
   base_url: string | null;
   model: string | null;
+  preset: string | null;
   credential_id: string | null;
+  credential_hint: string | null;
   allow_insecure_http: boolean;
-}
-
-export interface CredentialMetadata {
-  id: string;
-  label: string;
-  role: CredentialRole;
-  hint: string | null;
-  created_at_ms: number;
-  updated_at_ms: number;
 }
 
 export interface Readiness {
@@ -68,13 +62,34 @@ export interface ProfileTestResult {
   elapsed_ms: number;
 }
 
+export interface ProviderModel {
+  id: string;
+  label?: string;
+}
+
+export type ModelListOutcome = "ok" | "unsupported" | "no_matching_models";
+
+export interface ModelListResponse {
+  outcome: ModelListOutcome;
+  models: ProviderModel[];
+}
+
+export interface ListModelsRequest {
+  role: ProfileRole;
+  protocol: "open_ai" | "anthropic";
+  base_url: string | null;
+  allow_insecure_http: boolean;
+  allow_unfiltered_fallback?: boolean;
+  api_key: string | null;
+  profile_id: string | null;
+}
+
 export interface Settings {
-  schema_version: 2;
+  schema_version: 3;
   asr_profiles: AsrProfile[];
   llm_profiles: LlmProfile[];
   active_asr_profile_id: string | null;
   active_llm_profile_id: string | null;
-  credentials: CredentialMetadata[];
   cleanup: { max_tokens: number; temperature: number };
   hotkey: {
     dictate: string;
@@ -105,7 +120,7 @@ export interface Settings {
     prewarm?: boolean;
     max_recording_seconds?: number;
   };
-  ui: { locale: string; theme: string; onboarding_completed?: boolean | null; close_to_tray?: boolean };
+  ui: { locale: string; theme: string; onboarding_completed?: boolean | null; close_to_tray?: boolean; check_for_updates?: boolean };
 }
 
 export interface HistoryEntry {
@@ -171,11 +186,11 @@ export interface DictionaryEntry {
 }
 
 export type UpdaterStatus =
-  | "unconfigured"
   | "idle"
   | "checking"
   | "available"
   | "downloading"
+  | "installing"
   | "ready"
   | "error"
   | "up-to-date";
@@ -192,6 +207,7 @@ export interface UpdaterSnapshot {
   update: UpdateInfo | null;
   progress: number | null;
   message: string | null;
+  checked_at_ms: number | null;
 }
 
 export interface HistoryPage {
@@ -239,34 +255,25 @@ export const api = {
   updaterStatus: () => invoke<UpdaterSnapshot>("updater_status"),
   updaterCheck: () => invoke<UpdaterSnapshot>("updater_check"),
   updaterInstall: () => invoke<void>("updater_install"),
+  updaterRestart: () => invoke<void>("updater_restart"),
   copyText: (text: string) => invoke<void>("copy_text", { text }),
   apiStatus: () => invoke<ApiStatus>("api_status"),
-  saveAsrProfile: (profile: AsrProfile, confirmHostChange: boolean) =>
-    invoke<Settings>("save_asr_profile", { profile, confirmHostChange }),
-  saveLlmProfile: (profile: LlmProfile, confirmHostChange: boolean) =>
-    invoke<Settings>("save_llm_profile", { profile, confirmHostChange }),
+  saveAsrProfile: (profile: AsrProfile, apiKey: string | null, confirmHostChange: boolean) =>
+    invoke<Settings>("save_asr_profile", { profile, apiKey, confirmHostChange }),
+  saveLlmProfile: (profile: LlmProfile, apiKey: string | null, confirmHostChange: boolean) =>
+    invoke<Settings>("save_llm_profile", { profile, apiKey, confirmHostChange }),
   deleteProfile: (role: ProfileRole, id: string) =>
     invoke<Settings>("delete_profile", { role, id }),
   setActiveProfile: (role: ProfileRole, id: string) =>
     invoke<Settings>("set_active_profile", { role, id }),
-  createCredential: (label: string, role: CredentialRole, key: string) =>
-    invoke<Settings>("create_credential", { label, role, key }),
-  renameCredential: (id: string, label: string) =>
-    invoke<Settings>("rename_credential", { id, label }),
-  deleteCredential: (id: string) =>
-    invoke<Settings>("delete_credential", { id }),
-  replaceCredential: (
-    id: string,
-    key: string,
-    profileId: string | null,
-    replaceAll: boolean,
-  ) => invoke<Settings>("replace_credential", { id, key, profileId, replaceAll }),
-  cleanupLegacyKeys: () => invoke<string[]>("cleanup_legacy_keys"),
   exportConfig: () => invoke<boolean>("export_config"),
   importConfig: () => invoke<Settings | null>("import_config"),
   testProfile: (role: ProfileRole, id: string, mode: "check" | "request") =>
     invoke<ProfileTestResult>("test_profile", { role, id, mode }),
+  listModels: (args: ListModelsRequest) =>
+    invoke<ModelListResponse>("list_models", { args }),
   openSettingsFolder: () => invoke<void>("open_settings_folder"),
+  openExternalUrl: (url: string) => invoke<void>("open_external_url", { url }),
 };
 
 /** Safe status used before the first IPC response or when status loading fails. */
@@ -395,19 +402,18 @@ export const events = {
     listen("settings:changed", (e) => cb(e.payload as Settings)),
   onPendingChanged: (cb: (payload: { pending_count?: number; latest_id?: string }) => void) =>
     listen("pending:changed", (e) => cb(e.payload as { pending_count?: number; latest_id?: string })),
-  onAppNavigate: (cb: (payload: { tab: string }) => void) =>
+  onAppNavigate: (cb: (payload: { tab: string; section?: string }) => void) =>
     listen("app:navigate", (e) => {
-      const payload = e.payload as { tab?: unknown } | null;
-      if (payload && typeof payload.tab === "string") cb({ tab: payload.tab });
+      const payload = e.payload as { tab?: unknown; section?: unknown } | null;
+      if (payload && typeof payload.tab === "string") {
+        cb({ tab: payload.tab, section: typeof payload.section === "string" ? payload.section : undefined });
+      }
     }),
   onUpdaterChanged: (cb: (snapshot: UpdaterSnapshot) => void) =>
     listen("updater:changed", (e) => cb(e.payload as UpdaterSnapshot)),
-  onUpdaterProgress: (cb: (progress: number) => void) =>
-    listen("updater:progress", (e) => {
-      const payload = e.payload as { progress?: unknown } | number;
-      const value = typeof payload === "number" ? payload : payload?.progress;
-      if (typeof value === "number" && Number.isFinite(value)) cb(Math.min(1, Math.max(0, value)));
-    }),
+  /** Fired when a background check finds a version the user has not seen yet. */
+  onUpdaterAvailable: (cb: (update: UpdateInfo) => void) =>
+    listen("updater:available", (e) => cb(e.payload as UpdateInfo)),
 };
 
 export type { UnlistenFn };

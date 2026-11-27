@@ -65,6 +65,40 @@ fn build_menu(app: &AppHandle, active: bool) -> tauri::Result<Menu<tauri::Wry>> 
         .and_then(|state| state.config.snapshot().ok())
         .map_or_else(|| "en".to_string(), |settings| settings.ui.locale);
     let zh = locale == "zh-CN";
+    let updater = crate::updater::status();
+    let update_label = match (updater.status, updater.update.as_ref()) {
+        (crate::updater::UpdaterStatus::Ready, _) => {
+            if zh {
+                "重启以完成更新".to_string()
+            } else {
+                "Restart to finish update".to_string()
+            }
+        }
+        (crate::updater::UpdaterStatus::Available, Some(info)) => {
+            if zh {
+                format!("安装更新 {}", info.version)
+            } else {
+                format!("Install update {}", info.version)
+            }
+        }
+        (
+            crate::updater::UpdaterStatus::Downloading | crate::updater::UpdaterStatus::Installing,
+            _,
+        ) => {
+            if zh {
+                "正在更新…".to_string()
+            } else {
+                "Updating…".to_string()
+            }
+        }
+        _ => {
+            if zh {
+                "检查更新".to_string()
+            } else {
+                "Check for updates".to_string()
+            }
+        }
+    };
     let item = |id: &'static str, en_text: &'static str, zh_text: &'static str, enabled| {
         MenuItem::with_id(
             app,
@@ -94,7 +128,13 @@ fn build_menu(app: &AppHandle, active: bool) -> tauri::Result<Menu<tauri::Wry>> 
             true,
         )?)
         .item(&item("settings", "Settings", "设置", true)?)
-        .item(&item("update", "Check for updates", "检查更新", true)?)
+        .item(&MenuItem::with_id(
+            app,
+            "update",
+            update_label,
+            true,
+            None::<&str>,
+        )?)
         .separator()
         .item(&item("quit", "Quit", "退出", true)?)
         .build()
@@ -111,15 +151,33 @@ fn handle_menu(app: &AppHandle, id: &str) {
         }
         "recovery" => navigate(app, "history"),
         "settings" => navigate(app, "settings"),
-        "update" => {
-            navigate(app, "settings");
-            let app = app.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = crate::updater::check(&app).await;
-            });
-        }
+        "update" => handle_update(app),
         "quit" => app.exit(0),
         _ => {}
+    }
+}
+
+fn handle_update(app: &AppHandle) {
+    use crate::updater::UpdaterStatus;
+    let status = crate::updater::status().status;
+    navigate_to(app, "settings", Some("about"));
+    match status {
+        UpdaterStatus::Ready => {
+            if let Err(error) = crate::updater::restart(app) {
+                let _ = app.emit("session:error", serde_json::json!({ "message": error }));
+            }
+        }
+        // The settings page shows the release notes and the install button.
+        UpdaterStatus::Available
+        | UpdaterStatus::Checking
+        | UpdaterStatus::Downloading
+        | UpdaterStatus::Installing => {}
+        _ => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::updater::check(&app, crate::updater::CheckKind::Manual).await;
+            });
+        }
     }
 }
 
@@ -154,6 +212,13 @@ fn show_main(app: &AppHandle) {
 }
 
 fn navigate(app: &AppHandle, tab: &str) {
+    navigate_to(app, tab, None);
+}
+
+fn navigate_to(app: &AppHandle, tab: &str, section: Option<&str>) {
     show_main(app);
-    let _ = app.emit("app:navigate", serde_json::json!({ "tab": tab }));
+    let _ = app.emit(
+        "app:navigate",
+        serde_json::json!({ "tab": tab, "section": section }),
+    );
 }

@@ -1,0 +1,24 @@
+# oh-my-voice-type: agent notes
+
+Project rules that add to the user-level `AGENTS.md`. See `README.md` and `docs/dev-guide.md` for architecture.
+
+## Checks before committing
+
+- `cargo fmt --all --check`, `cargo clippy -p ovt-core -p ovt-desktop`, `cargo test -p ovt-core -p ovt-desktop`
+- `cd apps/desktop && npm test && npm run build` (vitest, then `tsc --noEmit` + vite)
+- `node --test scripts/release.test.mjs` (a directory argument such as `node --test scripts/` fails on Windows)
+- Browser preview of the UI: `http://localhost:5173/?mock=1` uses the IPC mock in `src/lib/tauri-mock.ts`; add `&update=1` to simulate an available update and `&locale=zh-CN` for Chinese.
+
+## Providers
+
+- This is a general voice-typing app: treat every ASR and LLM provider equally. Do not special-case Unisound (or any other provider) in presets, UI flows, defaults, or local skills.
+- Model lists are fetched live from each provider's `/models` endpoint via the `list_models` command (`crates/ovt-core/src/providers/models.rs`) once a valid API key is provided, using `apps/desktop/src/lib/provider-presets.ts` as fallback.
+
+## Releases and the updater
+
+- Never hand-edit versions. Use `node scripts/release.mjs <patch|minor|major|x.y.z|tag> [--push] [--dry-run] [--check]`; `check` verifies all seven version fields agree, and CI runs it. Update `CHANGELOG.md` with a `## [X.Y.Z]` section before cutting a release.
+- Windows ships a per-user NSIS installer (`-setup.exe`, `installMode: "currentUser"`), not MSI.
+- `.github/workflows/release.yml` runs the reusable `ci.yml` first, creates one draft release from `main`, builds both platforms into it with `uploadUpdaterJson: false`, then `scripts/github-release.mjs publish` cryptographically verifies every `.sig` against `tauri.conf.json`'s `pubkey`, uploads `SHA256SUMS.txt` and a single `latest.json`, and publishes (via the `release` GitHub Environment). Do not switch back to tauri-action's own `latest.json`: two parallel jobs race on it, and the app looks up the `darwin-universal` key (set in `lib.rs`), which tauri-action does not write.
+- Updater state lives in `src-tauri/src/updater.rs` and is serialised in kebab-case (`up-to-date`), matching `UpdaterStatus` in `src/lib/api.ts`.
+- Pushing a release or a `v*` tag publishes a public GitHub Release; get the user's go-ahead first.
+- GitHub retired the `macos-14` runner image; use `macos-latest`.

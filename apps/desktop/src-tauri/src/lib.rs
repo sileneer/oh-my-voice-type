@@ -41,6 +41,7 @@ pub fn run() {
                 return Err(Box::new(error));
             }
             dictation::init_session(&handle);
+            updater::init(&handle);
             tray::init(&handle).map_err(|error| format!("tray initialization failed: {error}"))?;
             if let Err(e) = dictation::install_hotkey(&handle) {
                 eprintln!("hotkey unavailable: {e}");
@@ -85,18 +86,16 @@ pub fn run() {
             commands::save_llm_profile,
             commands::delete_profile,
             commands::set_active_profile,
-            commands::create_credential,
-            commands::rename_credential,
-            commands::delete_credential,
-            commands::replace_credential,
-            commands::cleanup_legacy_keys,
             commands::export_config,
             commands::import_config,
             commands::test_profile,
+            commands::list_models,
             commands::updater_status,
             commands::updater_check,
             commands::updater_install,
+            commands::updater_restart,
             commands::open_settings_folder,
+            commands::open_external_url,
         ])
         .on_window_event(|window, event| {
             if window.label() != "main" {
@@ -125,7 +124,7 @@ pub fn run() {
         });
 }
 
-fn shutdown(app: &AppHandle) {
+pub(crate) fn shutdown(app: &AppHandle) {
     dictation::shutdown();
     if let Some(state) = app.try_state::<commands::AppState>() {
         state.inserters.audio.shutdown();

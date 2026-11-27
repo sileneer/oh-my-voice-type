@@ -59,8 +59,11 @@ objc2-app-kit = { version = "0.3", features = [
   "NSPasteboard",
   "NSEvent",
   "NSApplication",
+  "NSRunningApplication",
   "NSWorkspace",
   "NSScreen",
+  "NSWindow",
+  "libc",
 ] }
 core-foundation = "0.10"
 core-graphics = "0.24"

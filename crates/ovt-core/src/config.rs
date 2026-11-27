@@ -4,9 +4,9 @@
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -16,7 +16,6 @@ pub struct Settings {
     pub llm_profiles: Vec<LlmProfile>,
     pub active_asr_profile_id: Option<String>,
     pub active_llm_profile_id: Option<String>,
-    pub credentials: Vec<CredentialMetadata>,
     pub cleanup: CleanupSettings,
     pub hotkey: HotkeySettings,
     pub dictation: DictationSettings,
@@ -34,7 +33,6 @@ impl Default for Settings {
             llm_profiles: Vec::new(),
             active_asr_profile_id: None,
             active_llm_profile_id: None,
-            credentials: Vec::new(),
             cleanup: CleanupSettings::default(),
             hotkey: HotkeySettings::default(),
             dictation: DictationSettings::default(),
@@ -216,7 +214,9 @@ pub struct AsrProfile {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub extra_options: Vec<(String, String)>,
+    pub preset: Option<String>,
     pub credential_id: Option<String>,
+    pub credential_hint: Option<String>,
     pub allow_insecure_http: bool,
 }
 
@@ -229,7 +229,9 @@ impl Default for AsrProfile {
             base_url: None,
             model: None,
             extra_options: Vec::new(),
+            preset: None,
             credential_id: None,
+            credential_hint: None,
             allow_insecure_http: false,
         }
     }
@@ -326,7 +328,9 @@ pub struct LlmProfile {
     pub format: LlmApiFormat,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub preset: Option<String>,
     pub credential_id: Option<String>,
+    pub credential_hint: Option<String>,
     pub allow_insecure_http: bool,
 }
 
@@ -339,7 +343,9 @@ impl Default for LlmProfile {
             format: LlmApiFormat::default(),
             base_url: None,
             model: None,
+            preset: None,
             credential_id: None,
+            credential_hint: None,
             allow_insecure_http: false,
         }
     }
@@ -362,44 +368,6 @@ impl LlmProfile {
 
     pub fn is_configured(&self) -> bool {
         self.resolved_base_url().is_some() && self.resolved_model().is_some()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialRole {
-    Asr,
-    Llm,
-    Both,
-}
-
-impl CredentialRole {
-    pub fn allows(self, role: CredentialRole) -> bool {
-        self == CredentialRole::Both || self == role
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CredentialMetadata {
-    pub id: String,
-    pub label: String,
-    pub role: CredentialRole,
-    pub hint: Option<String>,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
-
-impl Default for CredentialMetadata {
-    fn default() -> Self {
-        Self {
-            id: "default-credential".into(),
-            label: "Credential".into(),
-            role: CredentialRole::Both,
-            hint: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        }
     }
 }
 
@@ -493,6 +461,8 @@ pub struct UiSettings {
     /// `None` means a legacy v2 install that should not be forced through onboarding.
     pub onboarding_completed: Option<bool>,
     pub close_to_tray: bool,
+    /// Check GitHub Releases for a new version in the background.
+    pub check_for_updates: bool,
 }
 
 impl Default for UiSettings {
@@ -502,6 +472,7 @@ impl Default for UiSettings {
             theme: "system".to_string(),
             onboarding_completed: None,
             close_to_tray: true,
+            check_for_updates: true,
         }
     }
 }
@@ -518,7 +489,10 @@ impl Settings {
                 base_url: legacy_optional(legacy.asr.base_url),
                 model: legacy_optional(legacy.asr.model),
                 extra_options: legacy.asr.extra_options,
+                preset: (legacy.asr.engine == AsrEngine::UnisoundU2)
+                    .then_some("unisound-u2".into()),
                 credential_id: Some("legacy-asr-credential".into()),
+                credential_hint: None,
                 allow_insecure_http: asr_allow_insecure_http,
             }],
             llm_profiles: vec![LlmProfile {
@@ -528,29 +502,13 @@ impl Settings {
                 format: legacy.llm.format,
                 base_url: legacy_optional(legacy.llm.base_url),
                 model: legacy_optional(legacy.llm.model),
+                preset: (legacy.llm.engine == LlmEngine::Unisound).then_some("unisound".into()),
                 credential_id: Some("legacy-llm-credential".into()),
+                credential_hint: None,
                 allow_insecure_http: llm_allow_insecure_http,
             }],
             active_asr_profile_id: Some("legacy-asr-profile".into()),
             active_llm_profile_id: Some("legacy-llm-profile".into()),
-            credentials: vec![
-                CredentialMetadata {
-                    id: "legacy-asr-credential".into(),
-                    label: "Legacy ASR credential".into(),
-                    role: CredentialRole::Asr,
-                    hint: None,
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                },
-                CredentialMetadata {
-                    id: "legacy-llm-credential".into(),
-                    label: "Legacy LLM credential".into(),
-                    role: CredentialRole::Llm,
-                    hint: None,
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                },
-            ],
             cleanup: CleanupSettings {
                 max_tokens: legacy.llm.max_tokens,
                 temperature: legacy.llm.temperature,
@@ -582,9 +540,6 @@ impl Settings {
         for profile in &self.llm_profiles {
             validate_id_and_label(&mut ids, &profile.id, &profile.label, "llm profile")?;
         }
-        for credential in &self.credentials {
-            validate_id_and_label(&mut ids, &credential.id, &credential.label, "credential")?;
-        }
 
         if let Some(id) = &self.active_asr_profile_id {
             if !self.asr_profiles.iter().any(|profile| &profile.id == id) {
@@ -601,18 +556,7 @@ impl Settings {
             }
         }
 
-        let credentials: HashMap<&str, CredentialRole> = self
-            .credentials
-            .iter()
-            .map(|credential| (credential.id.as_str(), credential.role))
-            .collect();
         for profile in &self.asr_profiles {
-            validate_credential(
-                &credentials,
-                profile.credential_id.as_deref(),
-                CredentialRole::Asr,
-                "asr profile",
-            )?;
             if let Some(base_url) = &profile.base_url {
                 require_http_url("asr base_url", base_url, profile.allow_insecure_http)?;
             }
@@ -623,7 +567,10 @@ impl Settings {
                 }
                 AsrEngine::UnisoundU2 => {
                     if let Some(model) = &profile.model {
-                        if model.trim() != crate::providers::u2_wire::MODEL {
+                        let trimmed = model.trim();
+                        if !trimmed.is_empty()
+                            && !trimmed.starts_with(crate::providers::u2_wire::MODEL)
+                        {
                             return Err(config_error("Unisound U2 model must be u2-asr"));
                         }
                     }
@@ -631,12 +578,6 @@ impl Settings {
             }
         }
         for profile in &self.llm_profiles {
-            validate_credential(
-                &credentials,
-                profile.credential_id.as_deref(),
-                CredentialRole::Llm,
-                "llm profile",
-            )?;
             if let Some(base_url) = &profile.base_url {
                 require_http_url("llm base_url", base_url, profile.allow_insecure_http)?;
             }
@@ -769,25 +710,6 @@ fn validate_id_and_label(
     Ok(())
 }
 
-fn validate_credential(
-    credentials: &HashMap<&str, CredentialRole>,
-    credential_id: Option<&str>,
-    role: CredentialRole,
-    kind: &str,
-) -> crate::Result<()> {
-    if let Some(id) = credential_id {
-        let credential_role = credentials
-            .get(id)
-            .ok_or_else(|| config_error(format!("{kind} credential_id {id:?} does not exist")))?;
-        if !credential_role.allows(role) {
-            return Err(config_error(format!(
-                "{kind} credential {id:?} is not valid for {role:?}"
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn require_explicit(value: &Option<String>, field: &str) -> crate::Result<()> {
     if value
         .as_deref()
@@ -799,7 +721,11 @@ fn require_explicit(value: &Option<String>, field: &str) -> crate::Result<()> {
     }
 }
 
-fn require_http_url(field: &str, value: &str, allow_insecure_http: bool) -> crate::Result<()> {
+pub(crate) fn require_http_url(
+    field: &str,
+    value: &str,
+    allow_insecure_http: bool,
+) -> crate::Result<()> {
     let value = value.trim();
     let invalid = || {
         config_error(format!(
@@ -885,14 +811,6 @@ mod tests {
             label: "LLM".into(),
             ..LlmProfile::default()
         });
-        settings.credentials.push(CredentialMetadata {
-            id: "credential".into(),
-            label: "Credential".into(),
-            role: CredentialRole::Both,
-            hint: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        });
         settings.active_asr_profile_id = Some("asr".into());
         settings.active_llm_profile_id = Some("llm".into());
         settings
@@ -901,10 +819,9 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         let settings = Settings::default();
-        assert_eq!(settings.schema_version, 2);
+        assert_eq!(settings.schema_version, 3);
         assert!(settings.asr_profiles.is_empty());
         assert!(settings.llm_profiles.is_empty());
-        assert!(settings.credentials.is_empty());
         assert_eq!(settings.active_asr_profile_id, None);
         assert_eq!(settings.active_llm_profile_id, None);
         assert_eq!(settings.cleanup.max_tokens, 1024);
@@ -927,7 +844,7 @@ mod tests {
             serde_json::from_str(r#"{"mutated_by_future_version": true}"#).unwrap();
         assert!(back.hotkey.smart_gestures);
         assert!(back.dictation.cleanup_enabled);
-        assert_eq!(back.schema_version, 2);
+        assert_eq!(back.schema_version, 3);
     }
 
     #[test]
@@ -935,7 +852,6 @@ mod tests {
         let mut value = serde_json::to_value(configured_settings()).unwrap();
         value["asr_profiles"][0]["api_key"] = "ovt-canary-secret".into();
         value["llm_profiles"][0]["secret"] = "ovt-canary-secret".into();
-        value["credentials"][0]["key"] = "ovt-canary-secret".into();
         let settings: Settings = serde_json::from_value(value).unwrap();
         let json = serde_json::to_string(&settings).unwrap();
         assert!(!json.contains("ovt-canary-secret"));
@@ -1048,11 +964,11 @@ mod tests {
     #[test]
     fn validates_schema_ids_labels_and_active_profiles() {
         let mut settings = configured_settings();
-        for schema_version in [0, 1, 3] {
+        for schema_version in [0, 1, 2, 4] {
             settings.schema_version = schema_version;
             assert!(settings.validate().is_err());
         }
-        settings.schema_version = 2;
+        settings.schema_version = 3;
 
         settings.asr_profiles[0].id = " ".into();
         assert!(settings.validate().is_err());
@@ -1060,9 +976,6 @@ mod tests {
         settings.llm_profiles[0].label = " ".into();
         assert!(settings.validate().is_err());
         settings.llm_profiles[0].label = "LLM".into();
-        settings.credentials[0].label = "".into();
-        assert!(settings.validate().is_err());
-        settings.credentials[0].label = "Credential".into();
 
         settings.active_asr_profile_id = Some("missing".into());
         assert!(settings.validate().is_err());
@@ -1079,36 +992,6 @@ mod tests {
         settings.llm_profiles[0].id = "asr".into();
         settings.active_llm_profile_id = Some("asr".into());
         assert!(settings.validate().is_err());
-
-        let mut settings = configured_settings();
-        settings.credentials[0].id = "asr".into();
-        assert!(settings.validate().is_err());
-
-        let mut settings = configured_settings();
-        settings.credentials.push(settings.credentials[0].clone());
-        assert!(settings.validate().is_err());
-    }
-
-    #[test]
-    fn validates_credential_references_and_roles() {
-        let mut settings = configured_settings();
-        settings.asr_profiles[0].credential_id = Some("missing".into());
-        assert!(settings.validate().is_err());
-        settings.asr_profiles[0].credential_id = Some("credential".into());
-        settings.credentials[0].role = CredentialRole::Llm;
-        assert!(settings.validate().is_err());
-        settings.llm_profiles[0].credential_id = Some("credential".into());
-        settings.credentials[0].role = CredentialRole::Asr;
-        assert!(settings.validate().is_err());
-        settings.credentials[0].role = CredentialRole::Both;
-        settings.validate().unwrap();
-
-        assert!(CredentialRole::Asr.allows(CredentialRole::Asr));
-        assert!(!CredentialRole::Asr.allows(CredentialRole::Llm));
-        assert!(CredentialRole::Llm.allows(CredentialRole::Llm));
-        assert!(!CredentialRole::Llm.allows(CredentialRole::Asr));
-        assert!(CredentialRole::Both.allows(CredentialRole::Asr));
-        assert!(CredentialRole::Both.allows(CredentialRole::Llm));
     }
 
     #[test]
@@ -1231,6 +1114,14 @@ mod tests {
         assert_eq!(settings.history.pending_retention_days, 7);
         assert!(!settings.audio.prewarm);
         assert!(settings.ui.close_to_tray);
+        assert!(settings.ui.check_for_updates);
+        let legacy_ui: UiSettings =
+            serde_json::from_str(r#"{"locale":"en","theme":"dark","close_to_tray":false}"#)
+                .unwrap();
+        assert!(
+            legacy_ui.check_for_updates,
+            "older settings files opt in to update checks"
+        );
         assert_eq!(settings.ui.onboarding_completed, None);
         assert_eq!(settings.dictation.default_mode, SessionMode::Dictate);
 
@@ -1397,14 +1288,6 @@ mod tests {
         assert_eq!(first.llm_profiles[0].model.as_deref(), Some("u2-flash"));
         assert_eq!(first.cleanup.max_tokens, legacy.llm.max_tokens);
         assert_eq!(first.cleanup.temperature, legacy.llm.temperature);
-        assert_eq!(first.credentials[0].id, "legacy-asr-credential");
-        assert_eq!(first.credentials[0].role, CredentialRole::Asr);
-        assert_eq!(first.credentials[1].id, "legacy-llm-credential");
-        assert_eq!(first.credentials[1].role, CredentialRole::Llm);
-        assert!(first
-            .credentials
-            .iter()
-            .all(|credential| { credential.created_at_ms == 0 && credential.updated_at_ms == 0 }));
         assert_eq!(first.hotkey, legacy.hotkey);
         assert_eq!(first.dictation, legacy.dictation);
         assert_eq!(first.context, legacy.context);

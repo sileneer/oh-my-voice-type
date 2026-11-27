@@ -254,7 +254,9 @@ pub fn show_inactive(window: &tauri::WebviewWindow) -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        let pointer = window.ns_window()? as *mut objc2_app_kit::NSWindow;
+        let pointer = window.ns_window().map_err(|error| {
+            ovt_core::Error::Unsupported(format!("window handle unavailable: {error}"))
+        })? as *mut objc2_app_kit::NSWindow;
         if pointer.is_null() {
             return Err(ovt_core::Error::Unsupported("NSWindow unavailable".into()));
         }

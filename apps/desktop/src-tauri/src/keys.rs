@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::{LazyLock, Mutex};
 
-const SERVICE: &str = "com.ovt.app";
+const SERVICE: &str = "io.github.sileneer.ohmyvoicetype";
 static VAULT_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn vault_guard() -> std::sync::MutexGuard<'static, ()> {

@@ -5,7 +5,10 @@
 //! text, `max_output_tokens` the cap. Output is a structured `output` array;
 //! we join `output_text` blocks.
 
-use super::{http_client, map_http_error, with_bearer, CleanupRequest, LlmProvider};
+use super::{
+    direct_http_client, format_network_error, http_client, map_http_error,
+    send_with_proxy_fallback, with_bearer, CleanupRequest, LlmProvider,
+};
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -33,13 +36,36 @@ impl OpenAiResponsesLlm {
     }
 
     fn payload(&self, req: &CleanupRequest) -> Value {
-        json!({
+        let mut body = json!({
             "model": self.model,
             "instructions": req.system,
             "input": [{"role": "user", "content": req.user}],
-            "max_output_tokens": req.max_tokens,
-            "temperature": req.temperature,
-        })
+            // OpenAI Responses API enforces max_output_tokens >= 16.
+            "max_output_tokens": req.max_tokens.max(16),
+        });
+        let bare = self
+            .model
+            .trim()
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.model)
+            .to_ascii_lowercase();
+        let fixed_temp = bare == "gpt-5"
+            || bare.starts_with("gpt-5-")
+            || bare.starts_with("gpt-5.")
+            || bare == "gpt-6"
+            || bare.starts_with("gpt-6-")
+            || bare.starts_with("gpt-6.")
+            || bare == "o1"
+            || bare.starts_with("o1-")
+            || bare == "o3"
+            || bare.starts_with("o3-")
+            || bare == "o4"
+            || bare.starts_with("o4-");
+        if !fixed_temp {
+            body["temperature"] = json!(req.temperature);
+        }
+        body
     }
 }
 
@@ -78,20 +104,18 @@ fn extract_output_text(value: &Value) -> Option<String> {
 #[async_trait]
 impl LlmProvider for OpenAiResponsesLlm {
     async fn complete(&self, req: CleanupRequest) -> Result<String> {
-        let resp = with_bearer(
-            self.client
-                .post(format!("{}/responses", self.base_url))
-                .json(&self.payload(&req)),
-            &self.api_key,
-        )
-        .send()
-        .await
-        .map_err(|e| Error::Network(e.to_string()))?;
+        let url = format!("{}/responses", self.base_url);
+        let payload = self.payload(&req);
+        let direct = direct_http_client();
+        let resp = send_with_proxy_fallback(&self.client, &direct, "llm (responses)", |http| {
+            Ok(with_bearer(http.post(&url).json(&payload), &self.api_key))
+        })
+        .await?;
         let status = resp.status();
         let text = resp
             .text()
             .await
-            .map_err(|e| Error::Network(e.to_string()))?;
+            .map_err(|e| Error::Network(format_network_error("llm (responses) body", &e)))?;
         if !status.is_success() {
             return Err(map_http_error("llm (responses)", status.as_u16(), &text));
         }
@@ -153,5 +177,16 @@ mod tests {
         assert_eq!(p["instructions"], "sys");
         assert_eq!(p["input"][0]["content"], "usr");
         assert_eq!(p["max_output_tokens"], 100);
+        assert!(p.get("temperature").is_some());
+
+        let small = OpenAiResponsesLlm::new("https://api.openai.com/v1", "k", "gpt-5-mini")
+            .payload(&CleanupRequest {
+                system: "sys".into(),
+                user: "usr".into(),
+                max_tokens: 1,
+                temperature: 0.2,
+            });
+        assert_eq!(small["max_output_tokens"], 16);
+        assert!(small.get("temperature").is_none());
     }
 }

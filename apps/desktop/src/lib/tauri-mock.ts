@@ -4,23 +4,19 @@ import type { HistoryEntry, Settings } from "./api";
 
 const now = Date.now();
 export const mockSettings: Settings = {
-  schema_version: 2,
+  schema_version: 3,
   asr_profiles: [{
-    id: "asr-demo", label: "Local Whisper", engine: "openai_compatible",
-    base_url: "http://127.0.0.1:8080/v1", model: "whisper-large-v3-turbo",
-    extra_options: [], credential_id: "cred-asr", allow_insecure_http: true,
+    id: "asr-demo", label: "OpenAI Whisper", engine: "openai_compatible", preset: "openai",
+    base_url: "https://api.openai.com/v1", model: "gpt-transcribe",
+    extra_options: [["response_format", "json"]], credential_id: "cred-asr", credential_hint: "1234", allow_insecure_http: false,
   }],
   llm_profiles: [{
-    id: "llm-demo", label: "Local LLM", engine: "custom", format: "open_ai_chat",
-    base_url: "http://127.0.0.1:8080/v1", model: "qwen2.5-7b-instruct",
-    credential_id: "cred-llm", allow_insecure_http: true,
+    id: "llm-demo", label: "DeepSeek", engine: "custom", format: "open_ai_chat", preset: "deepseek",
+    base_url: "https://api.deepseek.com/v1", model: "deepseek-flash",
+    credential_id: "cred-llm", credential_hint: "5678", allow_insecure_http: false,
   }],
   active_asr_profile_id: "asr-demo",
   active_llm_profile_id: "llm-demo",
-  credentials: [
-    { id: "cred-asr", label: "Whisper key", role: "asr", hint: "1234", created_at_ms: now, updated_at_ms: now },
-    { id: "cred-llm", label: "LLM key", role: "llm", hint: "5678", created_at_ms: now, updated_at_ms: now },
-  ],
   cleanup: { max_tokens: 1024, temperature: 0 },
   hotkey: { dictate: "right-alt", smart_gestures: true, dictate_alt: "right-opt", translate: "f8", edit_selection: "f9" },
   dictation: {
@@ -31,7 +27,7 @@ export const mockSettings: Settings = {
   context: { include_app_context: true, include_caret_context: false, max_caret_chars: 300 },
   history: { retention_days: 30, keep_audio: false, pending_retention_days: 7 },
   audio: { mic_device: null, mute_output_while_dictating: false, prewarm: true, max_recording_seconds: 540 },
-  ui: { locale: "en", theme: "system", onboarding_completed: true, close_to_tray: true },
+  ui: { locale: "en", theme: "system", onboarding_completed: true, close_to_tray: true, check_for_updates: true },
 };
 
 const sampleTexts = [
@@ -61,19 +57,40 @@ const cancelledSessions = new Set<string>();
 
 export function installTauriMock() {
   const params = new URLSearchParams(window.location.search);
-  if (params.get("locale") === "zh-CN") mockSettings.ui.locale = "zh-CN";
-  if (params.get("theme") === "dark") mockSettings.ui.theme = "dark";
-  if (params.get("onboarding") === "1") mockSettings.ui.onboarding_completed = false;
+  const state = structuredClone(mockSettings);
+  if (params.get("locale") === "zh-CN") state.ui.locale = "zh-CN";
+  const themeParam = params.get("theme");
+  if (themeParam === "dark" || themeParam === "light") state.ui.theme = themeParam;
+  if (params.get("onboarding") === "1") state.ui.onboarding_completed = false;
+  const emptyMock = params.get("empty") === "1";
+  if (emptyMock) {
+    state.asr_profiles = [];
+    state.llm_profiles = [];
+    state.active_asr_profile_id = null;
+    state.active_llm_profile_id = null;
+  }
+  const activeHistory = emptyMock ? [] : history;
+  const readinessFor = (role: "asr" | "llm") => {
+    const activeId = role === "asr" ? state.active_asr_profile_id : state.active_llm_profile_id;
+    const list = role === "asr" ? state.asr_profiles : state.llm_profiles;
+    const active = list.find((item) => item.id === activeId);
+    if (!active) return { state: "missing_profile", profile_id: null, credential_id: null, message: null };
+    if (!active.credential_id) return { state: "missing_key", profile_id: active.id, credential_id: null, message: null };
+    return { state: "ready", profile_id: active.id, credential_id: active.credential_id, message: null };
+  };
   mockWindows("main", "pill");
   mockIPC((command, payload) => {
     const args = (payload ?? {}) as Record<string, unknown>;
     switch (command) {
-      case "get_settings": return structuredClone(mockSettings);
-      case "set_settings": return args.settings;
+      case "get_settings": return structuredClone(state);
+      case "set_settings": {
+        Object.assign(state, structuredClone(args.settings));
+        return structuredClone(state);
+      }
       case "permission_status": return { platform: "windows", microphone: "granted_at_first_capture", accessibility: "not_required" };
       case "api_status": return {
-        asr: { state: "ready", profile_id: "asr-demo", credential_id: "cred-asr", message: null },
-        llm: { state: "ready", profile_id: "llm-demo", credential_id: "cred-llm", message: null },
+        asr: readinessFor("asr"),
+        llm: readinessFor("llm"),
       };
       case "list_mics": return ["Default microphone", "Studio Microphone"];
       case "history_list": {
@@ -85,28 +102,28 @@ export function installTauriMock() {
         const pinned = args.pinned === true;
         const from = typeof args.from_ms === "number" ? args.from_ms : 0;
         const to = typeof args.to_ms === "number" ? args.to_ms : Number.MAX_SAFE_INTEGER;
-        const filtered = history.filter((entry) =>
+        const filtered = activeHistory.filter((entry) =>
           (!query || entry.final_text.toLowerCase().includes(query) || entry.raw_text.toLowerCase().includes(query)) &&
           (!mode || entry.mode === mode) && (!delivery || entry.delivery_status === delivery) &&
           (!pinned || entry.pinned) && entry.created_at_ms >= from && entry.created_at_ms <= to,
         ).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.created_at_ms - a.created_at_ms);
         return { entries: structuredClone(filtered.slice(offset, offset + limit)), total: filtered.length };
       }
-      case "history_delete": history.splice(history.findIndex((entry) => entry.id === args.id), 1); return undefined;
-      case "history_delete_all": history.splice(0); return undefined;
+      case "history_delete": activeHistory.splice(activeHistory.findIndex((entry) => entry.id === args.id), 1); return undefined;
+      case "history_delete_all": activeHistory.splice(0); return undefined;
       case "history_set_pinned": {
-        const entry = history.find((item) => item.id === args.id);
+        const entry = activeHistory.find((item) => item.id === args.id);
         if (entry) entry.pinned = Boolean(args.pinned);
         return undefined;
       }
       case "history_reprocess": {
-        const entry = history.find((item) => item.id === args.id);
+        const entry = activeHistory.find((item) => item.id === args.id);
         if (entry) entry.final_text = `${entry.final_text} (reprocessed)`;
         return entry ? structuredClone(entry) : null;
       }
       case "history_export_audio": return false;
       case "copy_text": return undefined;
-      case "pending_list": return [
+      case "pending_list": return emptyMock ? [] : [
         { id: "pending-1", created_at_ms: now - 900_000, mode: "translate", target_language: "English", stage: "interrupted", attempts: 0, raw_text: "请把这段文字翻译成英文。", final_text: "", error: "Interrupted by restart", has_audio: true, delivery_uncertain: false },
         { id: "pending-2", created_at_ms: now - 1_800_000, mode: "dictate", target_language: null, stage: "needs_review", attempts: 1, raw_text: "Check the deployment status.", final_text: "Check the deployment status.", error: null, has_audio: false, delivery_uncertain: true },
       ];
@@ -118,9 +135,12 @@ export function installTauriMock() {
       case "dictionary_add": return [{ term: String(args.term) }];
       case "dictionary_rename": return [{ term: String(args.new_term) }];
       case "dictionary_remove": return [];
-      case "updater_status": return { status: "unconfigured", current_version: "0.1.0", update: null, progress: null, message: null };
-      case "updater_check": return { status: "unconfigured", current_version: "0.1.0", update: null, progress: null, message: null };
+      case "updater_status": return { status: "idle", current_version: "0.1.0", update: null, progress: null, message: null, checked_at_ms: null };
+      case "updater_check": return params.get("update") === "1"
+        ? { status: "available", current_version: "0.1.0", update: { version: "0.2.0", notes: "## What's Changed\n- Faster dictation start\n- Signed in-app updates", pub_date: new Date().toISOString() }, progress: null, message: null, checked_at_ms: Date.now() }
+        : { status: "up-to-date", current_version: "0.1.0", update: null, progress: null, message: null, checked_at_ms: Date.now() };
       case "updater_install": return undefined;
+      case "updater_restart": return undefined;
       case "session_start": {
         const request = args.request as { mode?: string; target_language?: string };
         const sessionId = `session-${Date.now()}`;
@@ -149,19 +169,108 @@ export function installTauriMock() {
           activeMockSession = null;
         }
         return undefined;
-      case "save_asr_profile":
-      case "save_llm_profile":
-      case "create_credential":
-      case "rename_credential":
-      case "replace_credential":
-      case "delete_profile":
-      case "set_active_profile":
-      case "delete_credential": return structuredClone(mockSettings);
-      case "test_profile": return { ok: true, verified: true, message: "Mock provider responded", elapsed_ms: 180 };
+      case "save_asr_profile": {
+        const incoming = structuredClone(args.profile) as Settings["asr_profiles"][number];
+        if (!incoming.id) incoming.id = `asr-${Date.now()}`;
+        if (typeof args.apiKey === "string" && args.apiKey.trim()) {
+          incoming.credential_id = `cred-${Date.now()}`;
+          incoming.credential_hint = args.apiKey.trim().slice(-4);
+        }
+        const index = state.asr_profiles.findIndex((item) => item.id === incoming.id);
+        if (index >= 0) state.asr_profiles[index] = incoming;
+        else state.asr_profiles.push(incoming);
+        if (!state.active_asr_profile_id) state.active_asr_profile_id = incoming.id;
+        return structuredClone(state);
+      }
+      case "save_llm_profile": {
+        const incoming = structuredClone(args.profile) as Settings["llm_profiles"][number];
+        if (!incoming.id) incoming.id = `llm-${Date.now()}`;
+        if (typeof args.apiKey === "string" && args.apiKey.trim()) {
+          incoming.credential_id = `cred-${Date.now()}`;
+          incoming.credential_hint = args.apiKey.trim().slice(-4);
+        }
+        const index = state.llm_profiles.findIndex((item) => item.id === incoming.id);
+        if (index >= 0) state.llm_profiles[index] = incoming;
+        else state.llm_profiles.push(incoming);
+        if (!state.active_llm_profile_id) state.active_llm_profile_id = incoming.id;
+        return structuredClone(state);
+      }
+      case "delete_profile": {
+        const role = args.role as "asr" | "llm";
+        const id = String(args.id ?? "");
+        if (role === "asr") {
+          state.asr_profiles = state.asr_profiles.filter((item) => item.id !== id);
+          if (state.active_asr_profile_id === id) state.active_asr_profile_id = null;
+        } else {
+          state.llm_profiles = state.llm_profiles.filter((item) => item.id !== id);
+          if (state.active_llm_profile_id === id) state.active_llm_profile_id = null;
+        }
+        return structuredClone(state);
+      }
+      case "set_active_profile": {
+        const role = args.role as "asr" | "llm";
+        const id = String(args.id ?? "");
+        if (role === "asr") state.active_asr_profile_id = id;
+        else state.active_llm_profile_id = id;
+        return structuredClone(state);
+      }
+      case "test_profile":
+        return args.mode === "check"
+          ? { ok: true, verified: false, message: "endpoint reachable (HTTP 200); key not verified", elapsed_ms: 85 }
+          : { ok: true, verified: true, message: "Mock provider responded", elapsed_ms: 180 };
+      case "list_models": {
+        const req = (args.args ?? {}) as {
+          role?: "asr" | "llm";
+          protocol?: "open_ai" | "anthropic";
+          base_url?: string | null;
+          api_key?: string | null;
+        };
+        if (req.api_key === "invalid-key") {
+          throw new Error("models: authentication failed — check the API key");
+        }
+        const ok = (models: Array<{ id: string; label?: string }>) => ({ outcome: "ok" as const, models });
+        const url = (req.base_url ?? "").toLowerCase();
+        if (req.protocol === "anthropic" || url.includes("anthropic")) {
+          return ok([
+            { id: "claude-haiku-5-5", label: "Claude Haiku 5.5" },
+            { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
+            { id: "claude-opus-5-5", label: "Claude Opus 5.5" },
+          ]);
+        }
+        if (req.role === "asr") {
+          if (url.includes("groq")) return ok([{ id: "whisper-large-v3-turbo" }, { id: "whisper-large-v3" }]);
+          if (url.includes("mistral")) return ok([{ id: "voxtral-mini-transcribe-3" }, { id: "voxtral-small-transcribe-3" }]);
+          if (url.includes("siliconflow")) return ok([{ id: "FunAudioLLM/SenseVoiceSmall" }, { id: "TeleAI/TeleSpeechASR" }]);
+          if (url.includes("stepfun")) return ok([{ id: "stepaudio-2.5-asr" }, { id: "step-asr" }]);
+          if (url.includes("unisound")) return { outcome: "no_matching_models" as const, models: [] };
+          if (url.includes("bigmodel") || url.includes("z.ai")) return ok([{ id: "glm-asr-2512" }, { id: "glm-asr" }]);
+          if (url.includes("openrouter")) return ok([{ id: "openai/whisper-large-v3-turbo" }, { id: "openai/whisper-large-v3" }, { id: "openai/whisper-1" }]);
+          return ok([
+            { id: "gpt-transcribe" },
+            { id: "gpt-4o-mini-transcribe" },
+            { id: "gpt-4o-transcribe" },
+            { id: "whisper-1" },
+          ]);
+        }
+        if (url.includes("minimax")) return ok([{ id: "MiniMax-M3.1-Flash" }, { id: "MiniMax-M3" }]);
+        if (url.includes("deepseek")) return ok([{ id: "deepseek-flash" }, { id: "deepseek-v4-pro" }, { id: "deepseek-chat" }]);
+        if (url.includes("googleapis")) return ok([{ id: "gemini-3.1-flash-lite" }, { id: "gemini-3-flash" }, { id: "gemini-2.5-flash" }]);
+        if (url.includes("x.ai")) return ok([{ id: "grok-4.3" }, { id: "grok-4.7" }]);
+        if (url.includes("moonshot")) return ok([{ id: "kimi-k2.5" }, { id: "kimi-k2.7-code" }]);
+        if (url.includes("dashscope")) return ok([{ id: "qwen-flash" }, { id: "qwen-plus" }, { id: "qwen-max" }]);
+        if (url.includes("groq")) return ok([{ id: "openai/gpt-oss-20b" }, { id: "llama-3.1-8b-instant" }, { id: "llama-3.3-70b-versatile" }]);
+        if (url.includes("unisound")) return ok([{ id: "u2-flash" }, { id: "u2" }, { id: "u2-med" }, { id: "u2-radimed" }]);
+        return ok([
+          { id: "gpt-5.4-mini" },
+          { id: "gpt-5.4-nano" },
+          { id: "gpt-5.4" },
+          { id: "gpt-4.1-mini" },
+        ]);
+      }
       case "export_config": return true;
-      case "import_config": return structuredClone(mockSettings);
-      case "cleanup_legacy_keys": return [];
+      case "import_config": return structuredClone(state);
       case "open_settings_folder": return undefined;
+      case "open_external_url": return undefined;
       default: return undefined;
     }
   }, { shouldMockEvents: true });

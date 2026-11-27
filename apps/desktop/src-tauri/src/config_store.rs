@@ -1,7 +1,5 @@
 use crate::keys::CredentialStore;
-use ovt_core::config::{
-    AsrProfile, CredentialMetadata, CredentialRole, LegacySettings, LlmProfile, Settings,
-};
+use ovt_core::config::{AsrProfile, LegacySettings, LlmProfile, Settings};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,9 +42,18 @@ pub struct ConfigExport {
     pub version: u32,
     pub asr_profiles: Vec<AsrProfile>,
     pub llm_profiles: Vec<LlmProfile>,
-    pub credentials: Vec<CredentialMetadata>,
+    #[serde(default, skip_serializing)]
+    pub credentials: Vec<LegacyCredentialMetadata>,
     pub active_asr_profile_id: Option<String>,
     pub active_llm_profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LegacyCredentialMetadata {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub hint: Option<String>,
 }
 
 pub struct ConfigStore {
@@ -57,10 +64,6 @@ pub struct ConfigStore {
 
 fn lock(settings: &Mutex<Settings>) -> Result<std::sync::MutexGuard<'_, Settings>, String> {
     settings.lock().map_err(|_| "settings lock poisoned".into())
-}
-
-fn now_ms() -> u64 {
-    ovt_core::dictation::unix_now_ms()
 }
 
 fn key_hint(secret: &str) -> Option<String> {
@@ -119,31 +122,52 @@ impl ConfigStore {
                 ] {
                     if let Some(secret) = vault.load(old_id).map_err(|e| e.to_string())? {
                         let secret = secret.trim();
-                        if secret.is_empty() {
-                            continue;
+                        if !secret.is_empty() {
+                            vault.store(new_id, secret).map_err(|e| e.to_string())?;
                         }
-                        vault.store(new_id, secret).map_err(|e| e.to_string())?;
-                        let timestamp = now_ms();
-                        if let Some(metadata) = migrated
-                            .credentials
-                            .iter_mut()
-                            .find(|credential| credential.id == new_id)
-                        {
-                            metadata.hint = key_hint(secret);
-                            metadata.created_at_ms = timestamp;
-                            metadata.updated_at_ms = timestamp;
-                        }
+                    }
+                }
+                for profile in migrated.asr_profiles.iter_mut() {
+                    if let Some(id) = profile.credential_id.as_deref() {
+                        profile.credential_hint = vault
+                            .load(id)
+                            .map_err(|e| e.to_string())?
+                            .as_deref()
+                            .and_then(key_hint);
+                    }
+                }
+                for profile in migrated.llm_profiles.iter_mut() {
+                    if let Some(id) = profile.credential_id.as_deref() {
+                        profile.credential_hint = vault
+                            .load(id)
+                            .map_err(|e| e.to_string())?
+                            .as_deref()
+                            .and_then(key_hint);
                     }
                 }
                 save_path(&path, &migrated)?;
                 migrated
             }
             Some(version) if version.as_u64() == Some(2) => {
+                let credentials: Vec<LegacyCredentialMetadata> = serde_json::from_value(
+                    value
+                        .get("credentials")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                )
+                .map_err(|e| format!("invalid credential metadata: {e}"))?;
+                let mut migrated: Settings =
+                    serde_json::from_value(value).map_err(|e| format!("invalid settings: {e}"))?;
+                migrate_profile_credentials(&mut migrated, &credentials, &vault)?;
+                save_path(&path, &migrated)?;
+                migrated
+            }
+            Some(version) if version.as_u64() == Some(3) => {
                 serde_json::from_value(value).map_err(|e| format!("invalid settings: {e}"))?
             }
             Some(version) => {
                 return Err(format!(
-                    "unsupported settings schema {}; this app supports version 2",
+                    "unsupported settings schema {}; this app supports version 3",
                     version
                 ))
             }
@@ -199,31 +223,64 @@ impl ConfigStore {
 
     pub fn save_asr_profile(
         &self,
-        profile: AsrProfile,
+        mut profile: AsrProfile,
+        api_key: Option<String>,
         confirm_host_change: bool,
     ) -> Result<Settings, String> {
         let mut settings = lock(&self.settings)?;
         let previous = settings.clone();
-        let mut profile = profile;
         if profile.id.is_empty() {
             profile.id = uuid::Uuid::new_v4().to_string();
         }
-        if let Some(existing) = settings
+        let existing = settings
             .asr_profiles
             .iter()
             .find(|item| item.id == profile.id)
+            .cloned();
+        if existing
+            .as_ref()
+            .is_some_and(|existing| existing.preset != profile.preset)
+            && !api_key.as_deref().is_some_and(|key| !key.trim().is_empty())
         {
-            let host_changed = endpoint_host(existing.base_url.as_deref())
-                != endpoint_host(profile.base_url.as_deref());
+            return Err("enter a new API key when changing providers".into());
+        }
+        let (credential_id, credential_hint) = prepare_profile_key(
+            existing
+                .as_ref()
+                .and_then(|item| item.credential_id.as_deref()),
+            existing
+                .as_ref()
+                .and_then(|item| item.credential_hint.clone()),
+            api_key.as_deref(),
+            &self.vault,
+        )?;
+        profile.credential_id = credential_id;
+        profile.credential_hint = credential_hint;
+        let old_credential_id = existing
+            .as_ref()
+            .and_then(|item| item.credential_id.clone());
+        let new_credential_id = profile.credential_id.clone();
+        let key_changed = old_credential_id != new_credential_id;
+        if let Some(existing) = existing {
+            let host_changed = endpoint_host(existing.resolved_base_url().as_deref())
+                != endpoint_host(profile.resolved_base_url().as_deref());
             if host_changed
-                && (existing.credential_id.is_some() || profile.credential_id.is_some())
+                && (existing.credential_id.is_some()
+                    || profile.credential_id.is_some()
+                    || api_key.as_deref().is_some_and(|key| !key.trim().is_empty()))
                 && !confirm_host_change
             {
+                if let Some(id) = profile.credential_id.as_deref() {
+                    if existing.credential_id.as_deref() != Some(id) {
+                        let _ = self.vault.delete(id);
+                    }
+                }
                 return Err(
                     "endpoint host changed; confirm sending the bound key to the new host".into(),
                 );
             }
         }
+        let saved_id = profile.id.clone();
         if let Some(index) = settings
             .asr_profiles
             .iter()
@@ -233,36 +290,83 @@ impl ConfigStore {
         } else {
             settings.asr_profiles.push(profile);
         }
-        self.commit_locked(&mut settings, previous)
+        if settings.active_asr_profile_id.is_none() {
+            settings.active_asr_profile_id = Some(saved_id);
+        }
+        let result = self.commit_locked(&mut settings, previous);
+        if result.is_err() && key_changed {
+            if let Some(id) = new_credential_id {
+                let _ = self.vault.delete(&id);
+            }
+        }
+        if result.is_ok() && key_changed {
+            if let Some(id) = old_credential_id {
+                let _ = self.vault.delete(&id);
+            }
+        }
+        result
     }
 
     pub fn save_llm_profile(
         &self,
-        profile: LlmProfile,
+        mut profile: LlmProfile,
+        api_key: Option<String>,
         confirm_host_change: bool,
     ) -> Result<Settings, String> {
         let mut settings = lock(&self.settings)?;
         let previous = settings.clone();
-        let mut profile = profile;
         if profile.id.is_empty() {
             profile.id = uuid::Uuid::new_v4().to_string();
         }
-        if let Some(existing) = settings
+        let existing = settings
             .llm_profiles
             .iter()
             .find(|item| item.id == profile.id)
+            .cloned();
+        if existing
+            .as_ref()
+            .is_some_and(|existing| existing.preset != profile.preset)
+            && !api_key.as_deref().is_some_and(|key| !key.trim().is_empty())
         {
-            let host_changed = endpoint_host(existing.base_url.as_deref())
-                != endpoint_host(profile.base_url.as_deref());
+            return Err("enter a new API key when changing providers".into());
+        }
+        let (credential_id, credential_hint) = prepare_profile_key(
+            existing
+                .as_ref()
+                .and_then(|item| item.credential_id.as_deref()),
+            existing
+                .as_ref()
+                .and_then(|item| item.credential_hint.clone()),
+            api_key.as_deref(),
+            &self.vault,
+        )?;
+        profile.credential_id = credential_id;
+        profile.credential_hint = credential_hint;
+        let old_credential_id = existing
+            .as_ref()
+            .and_then(|item| item.credential_id.clone());
+        let new_credential_id = profile.credential_id.clone();
+        let key_changed = old_credential_id != new_credential_id;
+        if let Some(existing) = existing {
+            let host_changed = endpoint_host(existing.resolved_base_url().as_deref())
+                != endpoint_host(profile.resolved_base_url().as_deref());
             if host_changed
-                && (existing.credential_id.is_some() || profile.credential_id.is_some())
+                && (existing.credential_id.is_some()
+                    || profile.credential_id.is_some()
+                    || api_key.as_deref().is_some_and(|key| !key.trim().is_empty()))
                 && !confirm_host_change
             {
+                if let Some(id) = profile.credential_id.as_deref() {
+                    if existing.credential_id.as_deref() != Some(id) {
+                        let _ = self.vault.delete(id);
+                    }
+                }
                 return Err(
                     "endpoint host changed; confirm sending the bound key to the new host".into(),
                 );
             }
         }
+        let saved_id = profile.id.clone();
         if let Some(index) = settings
             .llm_profiles
             .iter()
@@ -272,27 +376,63 @@ impl ConfigStore {
         } else {
             settings.llm_profiles.push(profile);
         }
-        self.commit_locked(&mut settings, previous)
+        if settings.active_llm_profile_id.is_none() {
+            settings.active_llm_profile_id = Some(saved_id);
+        }
+        let result = self.commit_locked(&mut settings, previous);
+        if result.is_err() && key_changed {
+            if let Some(id) = new_credential_id {
+                let _ = self.vault.delete(&id);
+            }
+        }
+        if result.is_ok() && key_changed {
+            if let Some(id) = old_credential_id {
+                let _ = self.vault.delete(&id);
+            }
+        }
+        result
     }
 
     pub fn delete_profile(&self, role: ProfileRole, id: String) -> Result<Settings, String> {
         let mut settings = lock(&self.settings)?;
         let previous = settings.clone();
-        match role {
+        let credential_id = match role {
             ProfileRole::Asr => {
-                settings.asr_profiles.retain(|profile| profile.id != id);
+                let position = settings
+                    .asr_profiles
+                    .iter()
+                    .position(|profile| profile.id == id);
+                let Some(position) = position else {
+                    return Err("ASR profile not found".into());
+                };
+                let credential_id = settings.asr_profiles[position].credential_id.clone();
+                settings.asr_profiles.remove(position);
                 if settings.active_asr_profile_id.as_deref() == Some(&id) {
                     settings.active_asr_profile_id = None;
                 }
+                credential_id
             }
             ProfileRole::Llm => {
-                settings.llm_profiles.retain(|profile| profile.id != id);
+                let position = settings
+                    .llm_profiles
+                    .iter()
+                    .position(|profile| profile.id == id);
+                let Some(position) = position else {
+                    return Err("LLM profile not found".into());
+                };
+                let credential_id = settings.llm_profiles[position].credential_id.clone();
+                settings.llm_profiles.remove(position);
                 if settings.active_llm_profile_id.as_deref() == Some(&id) {
                     settings.active_llm_profile_id = None;
                 }
+                credential_id
             }
+        };
+        let saved = self.commit_locked(&mut settings, previous)?;
+        if let Some(credential_id) = credential_id {
+            let _ = self.vault.delete(&credential_id);
         }
-        self.commit_locked(&mut settings, previous)
+        Ok(saved)
     }
 
     pub fn set_active_profile(&self, role: ProfileRole, id: String) -> Result<Settings, String> {
@@ -315,189 +455,15 @@ impl ConfigStore {
         self.commit_locked(&mut settings, previous)
     }
 
-    pub fn create_credential(
-        &self,
-        label: String,
-        role: CredentialRole,
-        secret: String,
-    ) -> Result<Settings, String> {
-        let secret = secret.trim();
-        if secret.is_empty() {
-            return Err("API key must not be empty".into());
-        }
-        if label.trim().is_empty() {
-            return Err("credential label must not be empty".into());
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        let timestamp = now_ms();
-        let metadata = CredentialMetadata {
-            id: id.clone(),
-            label: label.trim().to_string(),
-            role,
-            hint: key_hint(secret),
-            created_at_ms: timestamp,
-            updated_at_ms: timestamp,
-        };
-        self.vault.store(&id, secret).map_err(|e| e.to_string())?;
-        let mut settings = lock(&self.settings)?;
-        let previous = settings.clone();
-        settings.credentials.push(metadata);
-        if let Err(error) = self.save_locked(&settings) {
-            *settings = previous;
-            if let Err(cleanup) = self.vault.delete(&id) {
-                return Err(format!("{error}; cleanup also failed: {cleanup}"));
-            }
-            return Err(error);
-        }
-        Ok(settings.clone())
-    }
-
-    pub fn rename_credential(&self, id: String, label: String) -> Result<Settings, String> {
-        if label.trim().is_empty() {
-            return Err("credential label must not be empty".into());
-        }
-        let mut settings = lock(&self.settings)?;
-        let previous = settings.clone();
-        let credential = settings
-            .credentials
-            .iter_mut()
-            .find(|credential| credential.id == id)
-            .ok_or("credential not found")?;
-        credential.label = label.trim().to_string();
-        credential.updated_at_ms = now_ms();
-        self.commit_locked(&mut settings, previous)
-    }
-
-    pub fn delete_credential(&self, id: String) -> Result<Settings, String> {
-        let mut settings = lock(&self.settings)?;
-        let previous = settings.clone();
-        if !settings
-            .credentials
-            .iter()
-            .any(|credential| credential.id == id)
-        {
-            return Err("credential not found".into());
-        }
-        if settings
-            .asr_profiles
-            .iter()
-            .any(|profile| profile.credential_id.as_deref() == Some(&id))
-            || settings
-                .llm_profiles
-                .iter()
-                .any(|profile| profile.credential_id.as_deref() == Some(&id))
-        {
-            return Err("credential is still bound to a profile; unbind it first".into());
-        }
-        self.vault.delete(&id).map_err(|e| e.to_string())?;
-        settings
-            .credentials
-            .retain(|credential| credential.id != id);
-        self.commit_locked(&mut settings, previous)
-    }
-
-    pub fn replace_credential(
-        &self,
-        id: String,
-        secret: String,
-        profile_id: Option<String>,
-        replace_all: bool,
-    ) -> Result<Settings, String> {
-        let secret = secret.trim();
-        if secret.is_empty() {
-            return Err("API key must not be empty".into());
-        }
-        let mut settings = lock(&self.settings)?;
-        let previous = settings.clone();
-        let old = settings
-            .credentials
-            .iter()
-            .find(|credential| credential.id == id)
-            .cloned()
-            .ok_or("credential not found")?;
-        if !replace_all {
-            let profile_id = profile_id
-                .clone()
-                .ok_or("profile_id is required when not replacing all")?;
-            let bound = settings.asr_profiles.iter().any(|profile| {
-                profile.id == profile_id && profile.credential_id.as_deref() == Some(&id)
-            }) || settings.llm_profiles.iter().any(|profile| {
-                profile.id == profile_id && profile.credential_id.as_deref() == Some(&id)
-            });
-            if !bound {
-                return Err("selected profile does not use this credential".into());
-            }
-        }
-        let new_id = uuid::Uuid::new_v4().to_string();
-        let timestamp = now_ms();
-        let mut metadata = old;
-        metadata.id = new_id.clone();
-        metadata.hint = key_hint(secret);
-        metadata.updated_at_ms = timestamp;
-        self.vault
-            .store(&new_id, secret)
-            .map_err(|e| e.to_string())?;
-        for profile in settings.asr_profiles.iter_mut() {
-            if profile.credential_id.as_deref() == Some(&id)
-                && (replace_all || profile_id.as_deref() == Some(profile.id.as_str()))
-            {
-                profile.credential_id = Some(new_id.clone());
-            }
-        }
-        for profile in settings.llm_profiles.iter_mut() {
-            if profile.credential_id.as_deref() == Some(&id)
-                && (replace_all || profile_id.as_deref() == Some(profile.id.as_str()))
-            {
-                profile.credential_id = Some(new_id.clone());
-            }
-        }
-        settings.credentials.push(metadata);
-        if let Err(error) = self.save_locked(&settings) {
-            *settings = previous;
-            if let Err(cleanup) = self.vault.delete(&new_id) {
-                return Err(format!("{error}; cleanup also failed: {cleanup}"));
-            }
-            return Err(error);
-        }
-        Ok(settings.clone())
-    }
-
-    pub fn cleanup_legacy_keys(&self) -> Result<Vec<String>, String> {
-        let settings = lock(&self.settings)?;
-        let mut cleaned = Vec::new();
-        for (old_id, new_id) in [
-            ("asr", "legacy-asr-credential"),
-            ("llm", "legacy-llm-credential"),
-        ] {
-            if !settings
-                .credentials
-                .iter()
-                .any(|credential| credential.id == new_id)
-            {
-                continue;
-            }
-            if self
-                .vault
-                .load(new_id)
-                .map_err(|e| e.to_string())?
-                .is_some()
-            {
-                self.vault.delete(old_id).map_err(|e| e.to_string())?;
-                cleaned.push(old_id.to_string());
-            }
-        }
-        Ok(cleaned)
-    }
-
     pub fn export_data(&self) -> Result<ConfigExport, String> {
         let settings = lock(&self.settings)?;
         settings.validate().map_err(|e| e.to_string())?;
         Ok(ConfigExport {
             kind: "oh-my-voice-type/config".into(),
-            version: 1,
+            version: 2,
             asr_profiles: settings.asr_profiles.clone(),
             llm_profiles: settings.llm_profiles.clone(),
-            credentials: settings.credentials.clone(),
+            credentials: Vec::new(),
             active_asr_profile_id: settings.active_asr_profile_id.clone(),
             active_llm_profile_id: settings.active_llm_profile_id.clone(),
         })
@@ -519,49 +485,36 @@ impl ConfigStore {
         let raw = std::fs::read_to_string(path).map_err(|e| format!("cannot read export: {e}"))?;
         let mut data: ConfigExport =
             serde_json::from_str(&raw).map_err(|e| format!("invalid config export: {e}"))?;
-        if data.kind != "oh-my-voice-type/config" || data.version != 1 {
+        if data.kind != "oh-my-voice-type/config" || !matches!(data.version, 1 | 2) {
             return Err("unsupported config export format".into());
         }
-        let timestamp = now_ms();
-        let mut credential_ids = HashMap::new();
-        for credential in &mut data.credentials {
-            let new_id = uuid::Uuid::new_v4().to_string();
-            credential_ids.insert(credential.id.clone(), new_id.clone());
-            credential.id = new_id;
-            credential.hint = None;
-            credential.created_at_ms = timestamp;
-            credential.updated_at_ms = timestamp;
-        }
+        let hints: HashMap<String, Option<String>> = data
+            .credentials
+            .into_iter()
+            .map(|credential| (credential.id, credential.hint))
+            .collect();
         let mut profile_ids = HashMap::new();
         for profile in data.asr_profiles.iter_mut() {
             let new_id = uuid::Uuid::new_v4().to_string();
             profile_ids.insert(profile.id.clone(), new_id.clone());
             profile.id = new_id;
-            profile.credential_id = profile
+            profile.credential_hint = profile
                 .credential_id
                 .as_ref()
-                .map(|id| {
-                    credential_ids
-                        .get(id)
-                        .cloned()
-                        .ok_or("invalid credential reference")
-                })
-                .transpose()?;
+                .and_then(|id| hints.get(id).cloned())
+                .flatten();
+            profile.credential_id = None;
         }
         for profile in data.llm_profiles.iter_mut() {
             let new_id = uuid::Uuid::new_v4().to_string();
             profile_ids.insert(profile.id.clone(), new_id.clone());
             profile.id = new_id;
-            profile.credential_id = profile
+            profile.credential_hint = profile
                 .credential_id
                 .as_ref()
-                .map(|id| {
-                    credential_ids
-                        .get(id)
-                        .cloned()
-                        .ok_or("invalid credential reference")
-                })
-                .transpose()?;
+                .and_then(|id| hints.get(id).cloned())
+                .flatten();
+            profile.credential_id = None;
         }
         let remap_active = |id: Option<String>| {
             id.map(|id| {
@@ -578,7 +531,6 @@ impl ConfigStore {
         let previous = settings.clone();
         settings.asr_profiles.extend(data.asr_profiles);
         settings.llm_profiles.extend(data.llm_profiles);
-        settings.credentials.extend(data.credentials);
         if settings.active_asr_profile_id.is_none() {
             settings.active_asr_profile_id = active_asr_profile_id;
         }
@@ -587,6 +539,73 @@ impl ConfigStore {
         }
         self.commit_locked(&mut settings, previous)
     }
+}
+
+fn prepare_profile_key(
+    existing_id: Option<&str>,
+    existing_hint: Option<String>,
+    api_key: Option<&str>,
+    vault: &Arc<dyn CredentialStore>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let Some(secret) = api_key.map(str::trim).filter(|secret| !secret.is_empty()) else {
+        return match existing_id {
+            Some(id) => Ok((Some(id.to_string()), existing_hint)),
+            None => Err("API key is required".into()),
+        };
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    vault.store(&id, secret).map_err(|e| e.to_string())?;
+    Ok((Some(id), key_hint(secret)))
+}
+
+fn migrate_profile_credentials(
+    settings: &mut Settings,
+    credentials: &[LegacyCredentialMetadata],
+    vault: &Arc<dyn CredentialStore>,
+) -> Result<(), String> {
+    settings.schema_version = ovt_core::config::SETTINGS_SCHEMA_VERSION;
+    let mut counts = HashMap::new();
+    for profile in settings.asr_profiles.iter() {
+        if let Some(id) = profile.credential_id.as_deref() {
+            *counts.entry(id.to_string()).or_insert(0usize) += 1;
+        }
+    }
+    for profile in settings.llm_profiles.iter() {
+        if let Some(id) = profile.credential_id.as_deref() {
+            *counts.entry(id.to_string()).or_insert(0usize) += 1;
+        }
+    }
+    let migrate =
+        |credential_id: &mut Option<String>, hint: &mut Option<String>| -> Result<(), String> {
+            let Some(id) = credential_id.as_deref() else {
+                return Ok(());
+            };
+            let known_hint = credentials
+                .iter()
+                .find(|credential| credential.id == id)
+                .and_then(|credential| credential.hint.clone());
+            let secret = vault.load(id).map_err(|e| e.to_string())?;
+            if counts.get(id).copied().unwrap_or_default() > 1 {
+                let Some(secret) = secret else {
+                    *hint = known_hint;
+                    return Ok(());
+                };
+                let new_id = uuid::Uuid::new_v4().to_string();
+                vault.store(&new_id, &secret).map_err(|e| e.to_string())?;
+                *hint = key_hint(&secret);
+                *credential_id = Some(new_id);
+            } else {
+                *hint = known_hint.or_else(|| secret.as_deref().and_then(key_hint));
+            }
+            Ok(())
+        };
+    for profile in &mut settings.asr_profiles {
+        migrate(&mut profile.credential_id, &mut profile.credential_hint)?;
+    }
+    for profile in &mut settings.llm_profiles {
+        migrate(&mut profile.credential_id, &mut profile.credential_hint)?;
+    }
+    Ok(())
 }
 
 fn readiness(
@@ -691,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_credential_write_does_not_change_settings() {
+    fn failed_key_write_does_not_change_settings() {
         let path = temp_path("write-failure");
         let vault = Arc::new(MemoryVault {
             values: Mutex::new(BTreeMap::new()),
@@ -699,28 +718,85 @@ mod tests {
         });
         let store = ConfigStore::load(path, vault).unwrap();
         assert!(store
-            .create_credential("Test".into(), CredentialRole::Asr, "secret".into())
+            .save_asr_profile(AsrProfile::default(), Some("secret".into()), false)
             .is_err());
-        assert!(store.snapshot().unwrap().credentials.is_empty());
+        assert!(store.snapshot().unwrap().asr_profiles.is_empty());
     }
 
     #[test]
-    fn bound_credential_cannot_be_deleted() {
-        let path = temp_path("delete-bound");
+    fn profile_owns_its_key_and_delete_removes_it() {
+        let path = temp_path("profile-key");
         let vault = MemoryVault::new();
-        let store = ConfigStore::load(path, vault).unwrap();
+        let store = ConfigStore::load(path, vault.clone()).unwrap();
         let settings = store
-            .create_credential("Test".into(), CredentialRole::Asr, "secret".into())
+            .save_asr_profile(
+                AsrProfile {
+                    id: "p1".into(),
+                    label: "ASR".into(),
+                    ..AsrProfile::default()
+                },
+                Some("secret123".into()),
+                false,
+            )
             .unwrap();
-        let id = settings.credentials[0].id.clone();
-        let profile = AsrProfile {
-            id: "p1".into(),
-            label: "ASR".into(),
-            credential_id: Some(id.clone()),
-            ..AsrProfile::default()
-        };
-        store.save_asr_profile(profile, false).unwrap();
-        assert!(store.delete_credential(id).is_err());
+        let id = settings.asr_profiles[0].credential_id.clone().unwrap();
+        assert_eq!(
+            settings.asr_profiles[0].credential_hint.as_deref(),
+            Some("t123")
+        );
+        assert_eq!(vault.load(&id).unwrap().as_deref(), Some("secret123"));
+        store
+            .set_active_profile(ProfileRole::Asr, "p1".into())
+            .unwrap();
+        assert!(store.status().unwrap().asr.state == ReadinessState::Ready);
+
+        let settings = store
+            .save_asr_profile(settings.asr_profiles[0].clone(), None, false)
+            .unwrap();
+        assert_eq!(
+            settings.asr_profiles[0].credential_id.as_deref(),
+            Some(id.as_str())
+        );
+        store.delete_profile(ProfileRole::Asr, "p1".into()).unwrap();
+        assert!(vault.load(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn changing_provider_requires_a_new_key() {
+        let path = temp_path("provider-change");
+        let vault = MemoryVault::new();
+        let store = ConfigStore::load(path, vault.clone()).unwrap();
+        let settings = store
+            .save_asr_profile(
+                AsrProfile {
+                    id: "p1".into(),
+                    label: "Unisound".into(),
+                    preset: Some("unisound-u2".into()),
+                    ..AsrProfile::default()
+                },
+                Some("old-secret".into()),
+                false,
+            )
+            .unwrap();
+        let old_id = settings.asr_profiles[0].credential_id.clone().unwrap();
+        let mut changed = settings.asr_profiles[0].clone();
+        changed.preset = Some("openai".into());
+        changed.label = "OpenAI".into();
+        changed.engine = ovt_core::config::AsrEngine::OpenaiCompatible;
+        changed.base_url = Some("https://api.openai.com/v1".into());
+        changed.model = Some("whisper-1".into());
+        assert!(store
+            .save_asr_profile(changed.clone(), None, false)
+            .is_err());
+        assert_eq!(vault.load(&old_id).unwrap().as_deref(), Some("old-secret"));
+
+        let saved = store
+            .save_asr_profile(changed, Some("new-secret".into()), true)
+            .unwrap();
+        let new_id = saved.asr_profiles[0].credential_id.clone().unwrap();
+        assert_ne!(old_id, new_id);
+        assert!(vault.load(&old_id).unwrap().is_none());
+        assert_eq!(vault.load(&new_id).unwrap().as_deref(), Some("new-secret"));
     }
 
     #[test]
@@ -729,18 +805,14 @@ mod tests {
         let vault = MemoryVault::new();
         let store = ConfigStore::load(path, vault).unwrap();
         let canary = "sk-canary-do-not-export";
-        let settings = store
-            .create_credential("Test".into(), CredentialRole::Asr, canary.into())
-            .unwrap();
-        let id = settings.credentials[0].id.clone();
         store
             .save_asr_profile(
                 AsrProfile {
                     id: "p1".into(),
                     label: "ASR".into(),
-                    credential_id: Some(id),
                     ..AsrProfile::default()
                 },
+                Some(canary.into()),
                 false,
             )
             .unwrap();
@@ -751,12 +823,46 @@ mod tests {
         store.export_to(&export_path).unwrap();
         let raw = std::fs::read_to_string(&export_path).unwrap();
         assert!(!raw.contains(canary));
+        assert!(!raw.contains("credentials"));
 
         let target_path = temp_path("import-target");
         let target = ConfigStore::load(target_path, MemoryVault::new()).unwrap();
         let imported = target.import_from(&export_path).unwrap();
         assert_eq!(imported.asr_profiles.len(), 1);
+        assert!(imported.asr_profiles[0].credential_id.is_none());
         assert!(target.status().unwrap().asr.state == ReadinessState::MissingKey);
+    }
+
+    #[test]
+    fn v2_shared_credentials_are_split_between_profiles() {
+        let path = temp_path("v2-migration");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema_version": 2,
+                "asr_profiles": [{ "id": "a1", "label": "ASR", "credential_id": "shared" }],
+                "llm_profiles": [{ "id": "l1", "label": "LLM", "credential_id": "shared" }],
+                "credentials": [{ "id": "shared", "label": "Shared", "role": "both", "hint": "1234" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let vault = MemoryVault::new();
+        vault.store("shared", "shared-secret").unwrap();
+        let store = ConfigStore::load(path, vault.clone()).unwrap();
+        let settings = store.snapshot().unwrap();
+        assert_eq!(settings.schema_version, 3);
+        let asr_id = settings.asr_profiles[0].credential_id.clone().unwrap();
+        let llm_id = settings.llm_profiles[0].credential_id.clone().unwrap();
+        assert_ne!(asr_id, llm_id);
+        assert_eq!(
+            vault.load(&asr_id).unwrap().as_deref(),
+            Some("shared-secret")
+        );
+        assert_eq!(
+            vault.load(&llm_id).unwrap().as_deref(),
+            Some("shared-secret")
+        );
     }
 
     #[test]
@@ -788,7 +894,7 @@ mod tests {
         vault.store("llm", "llm-canary").unwrap();
         let store = ConfigStore::load(path.clone(), vault.clone()).unwrap();
         let settings = store.snapshot().unwrap();
-        assert_eq!(settings.schema_version, 2);
+        assert_eq!(settings.schema_version, 3);
         assert_eq!(
             settings.active_asr_profile_id.as_deref(),
             Some("legacy-asr-profile")
@@ -806,7 +912,6 @@ mod tests {
 
         let reloaded = ConfigStore::load(path, vault).unwrap().snapshot().unwrap();
         assert_eq!(reloaded.asr_profiles[0].id, settings.asr_profiles[0].id);
-        assert_eq!(reloaded.credentials.len(), settings.credentials.len());
     }
 
     #[test]
@@ -818,20 +923,53 @@ mod tests {
             label: "ASR".into(),
             ..AsrProfile::default()
         };
-        store.save_asr_profile(profile.clone(), false).unwrap();
+        store
+            .save_asr_profile(profile.clone(), Some("secret".into()), false)
+            .unwrap();
         let invalid = AsrProfile {
             label: String::new(),
             ..profile
         };
-        assert!(store.save_asr_profile(invalid, false).is_err());
+        assert!(store.save_asr_profile(invalid, None, false).is_err());
         assert_eq!(store.snapshot().unwrap().asr_profiles[0].label, "ASR");
     }
 
     #[test]
-    fn invalid_v2_settings_are_rejected_without_overwriting_file() {
-        let path = temp_path("invalid-v2");
+    fn first_saved_profile_auto_activates_without_stealing_existing_active() {
+        let path = temp_path("auto-activate");
+        let store = ConfigStore::load(path, MemoryVault::new()).unwrap();
+        let first = store
+            .save_asr_profile(
+                AsrProfile {
+                    id: "p1".into(),
+                    label: "First".into(),
+                    ..AsrProfile::default()
+                },
+                Some("secret-one".into()),
+                false,
+            )
+            .unwrap();
+        assert_eq!(first.active_asr_profile_id.as_deref(), Some("p1"));
+
+        let second = store
+            .save_asr_profile(
+                AsrProfile {
+                    id: "p2".into(),
+                    label: "Second".into(),
+                    ..AsrProfile::default()
+                },
+                Some("secret-two".into()),
+                false,
+            )
+            .unwrap();
+        assert_eq!(second.active_asr_profile_id.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn invalid_v3_settings_are_rejected_without_overwriting_file() {
+        let path = temp_path("invalid-v3");
         let raw = serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "asr_profiles": [{ "id": "", "label": "Broken" }]
         })
         .to_string();

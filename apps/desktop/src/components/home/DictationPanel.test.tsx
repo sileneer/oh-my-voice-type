@@ -24,8 +24,7 @@ function props(overrides: Partial<Parameters<typeof DictationPanel>[0]> = {}) {
     onTargetChange: vi.fn(),
     onStart: vi.fn(),
     onCancel: vi.fn(),
-    onSave: vi.fn(async () => {}),
-    onError: vi.fn(),
+    onOpenHotkeys: vi.fn(),
     ...overrides,
   };
 }
@@ -40,18 +39,32 @@ describe("DictationPanel", () => {
       },
     });
     const { rerender } = render(<DictationPanel {...panelProps} />);
-    expect(screen.getByRole("button", { name: "Start Translate" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Start translating" })).toBeDisabled();
     expect(screen.getByText("Translation requires a working LLM provider.")).toBeInTheDocument();
 
     rerender(<DictationPanel {...props({ mode: "translate" })} />);
-    expect(screen.getByRole("button", { name: "Start Translate" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Start translating" })).toBeEnabled();
+  });
+
+  it("shows the hotkey for the selected mode and links to its settings", async () => {
+    const user = userEvent.setup();
+    const panelProps = props();
+    render(<DictationPanel {...panelProps} />);
+    expect(screen.getByText("Right Alt")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Change hotkeys/ }));
+    expect(panelProps.onOpenHotkeys).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the saved translation target selectable", () => {
+    render(<DictationPanel {...props({ mode: "translate", targetLanguage: "English" })} />);
+    expect(screen.getByRole("combobox")).toHaveTextContent("English");
   });
 
   it("starts and cancels an active session", async () => {
     const user = userEvent.setup();
     const panelProps = props();
     const { rerender } = render(<DictationPanel {...panelProps} />);
-    await user.click(screen.getByRole("button", { name: "Start Dictate" }));
+    await user.click(screen.getByRole("button", { name: "Start dictating" }));
     expect(panelProps.onStart).toHaveBeenCalledOnce();
 
     const recordingProps = props({ session: "recording", level: 0.8 });

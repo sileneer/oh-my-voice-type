@@ -1,10 +1,6 @@
 //! Live U2-ASR integration test (opt-in; requires network + credentials).
 //!
-//! Run explicitly after exporting the key (never printed here):
-//! Powershell:
-//!   $env:U2_ASR_TOKEN_PLAN_API_KEY = (Get-Content ..\skills\u2-asr-pro\.env.local |
-//!     Where-Object { $_ -match 'U2_ASR_TOKEN_PLAN_API_KEY=' } |
-//!     ForEach-Object { $_.Split('=',2)[1].Trim() } | Where-Object { $_ })
+//! Run explicitly after exporting `U2_ASR_TOKEN_PLAN_API_KEY`:
 //!   cargo test -p ovt-core --test u2_live -- --ignored --nocapture
 //!
 //! What it proves: authentication, multipart upload, task creation with

@@ -6,8 +6,9 @@
 //! prompt as continuing conversation, so both compose naturally).
 
 use super::{
-    audio_part, default_capabilities, http_client, map_http_error, with_bearer, AsrCapabilities,
-    AsrProvider, CleanupRequest, LlmProvider, TranscribeRequest, Transcript,
+    audio_part, default_capabilities, direct_http_client, format_network_error, http_client,
+    map_http_error, send_with_proxy_fallback, with_bearer, AsrCapabilities, AsrProvider,
+    CleanupRequest, LlmProvider, TranscribeRequest, Transcript,
 };
 use crate::error::{Error, Result};
 use async_trait::async_trait;
@@ -20,6 +21,10 @@ pub struct OpenAiCompatibleAsr {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub response_format: Option<String>,
+    pub send_temperature: bool,
+    pub send_language: bool,
+    pub send_prompt: bool,
 }
 
 impl OpenAiCompatibleAsr {
@@ -33,6 +38,20 @@ impl OpenAiCompatibleAsr {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             model: model.into(),
+            response_format: Some("verbose_json".into()),
+            send_temperature: true,
+            send_language: true,
+            send_prompt: true,
+        }
+    }
+
+    /// Resolve the `response_format` sent to `/audio/transcriptions`.
+    /// OpenAI's `gpt-*-transcribe*` models reject `verbose_json` with HTTP 400,
+    /// so fall back to `json` automatically when `verbose_json` is configured.
+    fn effective_response_format(&self) -> Option<&str> {
+        match self.response_format.as_deref() {
+            Some("verbose_json") if is_gpt_transcribe_model(&self.model) => Some("json"),
+            other => other,
         }
     }
 
@@ -93,34 +112,46 @@ impl AsrProvider for OpenAiCompatibleAsr {
             hotwords,
             context,
         } = req;
-        let body = audio_part(audio)?;
-        let mut form = body
-            .form
-            .text("model", self.model.clone())
-            .text("response_format", "verbose_json")
-            .text("temperature", "0");
-        if let Some(lang) = language.as_deref().filter(|l| !l.is_empty()) {
-            form = form.text("language", lang.to_string());
-        }
-        if let Some(prompt) = Self::build_prompt(&hotwords, context.as_deref()) {
-            form = form.text("prompt", prompt);
-        }
-
-        let resp = with_bearer(
-            self.client
-                .post(format!("{}/audio/transcriptions", self.base_url)),
-            &self.api_key,
-        )
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| Error::Network(e.to_string()))?;
+        let url = format!("{}/audio/transcriptions", self.base_url);
+        let response_format = self.effective_response_format().map(str::to_string);
+        let prompt = if self.send_prompt {
+            Self::build_prompt(&hotwords, context.as_deref())
+        } else {
+            None
+        };
+        let lang = if self.send_language {
+            language
+                .as_deref()
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+        } else {
+            None
+        };
+        let direct = direct_http_client();
+        let resp = send_with_proxy_fallback(&self.client, &direct, "asr", |http| {
+            let body = audio_part(audio.clone())?;
+            let mut form = body.form.text("model", self.model.clone());
+            if let Some(fmt) = &response_format {
+                form = form.text("response_format", fmt.clone());
+            }
+            if self.send_temperature {
+                form = form.text("temperature", "0");
+            }
+            if let Some(language) = &lang {
+                form = form.text("language", language.clone());
+            }
+            if let Some(prompt_text) = &prompt {
+                form = form.text("prompt", prompt_text.clone());
+            }
+            Ok(with_bearer(http.post(&url), &self.api_key).multipart(form))
+        })
+        .await?;
 
         let status = resp.status();
         let text = resp
             .text()
             .await
-            .map_err(|e| Error::Network(e.to_string()))?;
+            .map_err(|e| Error::Network(format_network_error("asr body", &e)))?;
         if !status.is_success() {
             return Err(map_http_error("asr", status.as_u16(), &text));
         }
@@ -165,6 +196,71 @@ impl OpenAiCompatibleLlm {
             model: model.into(),
         }
     }
+
+    pub fn payload(&self, req: &CleanupRequest) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": req.system},
+                {"role": "user", "content": req.user},
+            ],
+        });
+        if uses_max_completion_tokens(&self.model) {
+            body["max_completion_tokens"] = serde_json::json!(req.max_tokens);
+        } else {
+            body["max_tokens"] = serde_json::json!(req.max_tokens);
+        }
+        if !has_fixed_temperature(&self.model) {
+            body["temperature"] = serde_json::json!(req.temperature);
+        }
+        body
+    }
+}
+
+fn bare_model_name(model: &str) -> String {
+    model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase()
+}
+
+fn is_gpt_transcribe_model(model: &str) -> bool {
+    let bare = bare_model_name(model);
+    bare.starts_with("gpt-") && bare.contains("transcribe")
+}
+
+fn is_openai_reasoning_family(bare: &str) -> bool {
+    bare == "gpt-5"
+        || bare.starts_with("gpt-5-")
+        || bare.starts_with("gpt-5.")
+        || bare == "gpt-6"
+        || bare.starts_with("gpt-6-")
+        || bare.starts_with("gpt-6.")
+        || bare == "o1"
+        || bare.starts_with("o1-")
+        || bare == "o3"
+        || bare.starts_with("o3-")
+        || bare == "o4"
+        || bare.starts_with("o4-")
+}
+
+/// OpenAI's GPT-5 and o-series models reject `max_tokens` in Chat Completions
+/// and require `max_completion_tokens` instead.
+fn uses_max_completion_tokens(model: &str) -> bool {
+    !model.contains('/') && is_openai_reasoning_family(&bare_model_name(model))
+}
+
+/// Models whose APIs reject custom temperatures (e.g. `kimi-k2.5` only allows
+/// `temperature=1`, `gpt-5*`/o-series reject non-default temperature, and
+/// `MiniMax-M3*` locks temperature to 1).
+fn has_fixed_temperature(model: &str) -> bool {
+    let bare = bare_model_name(model);
+    is_openai_reasoning_family(&bare)
+        || bare.starts_with("kimi-k2.5")
+        || bare.starts_with("kimi-k2.7")
+        || bare.starts_with("minimax-m3")
 }
 
 #[derive(Deserialize)]
@@ -185,29 +281,18 @@ struct ChatMessage {
 #[async_trait]
 impl LlmProvider for OpenAiCompatibleLlm {
     async fn complete(&self, req: CleanupRequest) -> Result<String> {
-        let payload = serde_json::json!({
-            "model": self.model,
-            "temperature": req.temperature,
-            "max_tokens": req.max_tokens,
-            "messages": [
-                {"role": "system", "content": req.system},
-                {"role": "user", "content": req.user},
-            ],
-        });
-        let resp = with_bearer(
-            self.client
-                .post(format!("{}/chat/completions", self.base_url))
-                .json(&payload),
-            &self.api_key,
-        )
-        .send()
-        .await
-        .map_err(|e| Error::Network(e.to_string()))?;
+        let payload = self.payload(&req);
+        let url = format!("{}/chat/completions", self.base_url);
+        let direct = direct_http_client();
+        let resp = send_with_proxy_fallback(&self.client, &direct, "llm", |http| {
+            Ok(with_bearer(http.post(&url).json(&payload), &self.api_key))
+        })
+        .await?;
         let status = resp.status();
         let text = resp
             .text()
             .await
-            .map_err(|e| Error::Network(e.to_string()))?;
+            .map_err(|e| Error::Network(format_network_error("llm body", &e)))?;
         if !status.is_success() {
             return Err(map_http_error("llm", status.as_u16(), &text));
         }
@@ -247,6 +332,56 @@ mod tests {
                 .as_deref(),
             Some("K8s, Claude. Talking in #engineering")
         );
+    }
+
+    #[test]
+    fn request_options_default_to_whisper_shape() {
+        let provider = OpenAiCompatibleAsr::new("https://asr.example/v1", "key", "whisper-1");
+        assert_eq!(provider.response_format.as_deref(), Some("verbose_json"));
+        assert_eq!(provider.effective_response_format(), Some("verbose_json"));
+        assert!(provider.send_temperature);
+        assert!(provider.send_language);
+        assert!(provider.send_prompt);
+    }
+
+    #[test]
+    fn gpt_transcribe_models_avoid_verbose_json() {
+        let provider =
+            OpenAiCompatibleAsr::new("https://api.openai.com/v1", "key", "gpt-4o-mini-transcribe");
+        assert_eq!(provider.effective_response_format(), Some("json"));
+    }
+
+    #[test]
+    fn llm_payload_adapts_for_fixed_temperature_and_gpt5_models() {
+        let req = CleanupRequest {
+            system: "sys".into(),
+            user: "usr".into(),
+            max_tokens: 256,
+            temperature: 0.2,
+        };
+
+        let standard = OpenAiCompatibleLlm::new("https://api.openai.com/v1", "k", "gpt-4.1-mini")
+            .payload(&req);
+        assert_eq!(standard["max_tokens"], 256);
+        assert!(standard.get("max_completion_tokens").is_none());
+        assert!(standard.get("temperature").is_some());
+
+        let gpt5 =
+            OpenAiCompatibleLlm::new("https://api.openai.com/v1", "k", "gpt-5-mini").payload(&req);
+        assert_eq!(gpt5["max_completion_tokens"], 256);
+        assert!(gpt5.get("max_tokens").is_none());
+        assert!(gpt5.get("temperature").is_none());
+
+        let kimi =
+            OpenAiCompatibleLlm::new("https://api.moonshot.cn/v1", "k", "kimi-k2.5").payload(&req);
+        assert_eq!(kimi["max_tokens"], 256);
+        assert!(kimi.get("temperature").is_none());
+
+        let minimax =
+            OpenAiCompatibleLlm::new("https://api.minimaxi.com/v1", "k", "MiniMax-M3.1-Flash")
+                .payload(&req);
+        assert_eq!(minimax["max_tokens"], 256);
+        assert!(minimax.get("temperature").is_none());
     }
 
     #[test]

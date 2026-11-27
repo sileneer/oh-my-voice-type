@@ -895,25 +895,38 @@ fn build_session_providers(
         .map_err(|error| error.to_string())?
         .ok_or("ASR API key missing — open Settings and add it")?;
     let asr_provider = build_asr(asr, &asr_key).ok_or("ASR profile is not configured")?;
-    let requires_llm = mode != SessionMode::Dictate || settings.dictation.cleanup_enabled;
-    if !requires_llm {
+    let strictly_requires_llm = mode != SessionMode::Dictate;
+    if !strictly_requires_llm && !settings.dictation.cleanup_enabled {
         return Ok((asr_provider, None));
     }
-    let llm = settings
+    let Some(llm) = settings
         .llm_profiles
         .iter()
         .find(|profile| Some(&profile.id) == settings.active_llm_profile_id.as_ref())
-        .ok_or("LLM is required for this mode; select an LLM profile in Settings")?;
-    let llm_key_id = llm
-        .credential_id
-        .as_deref()
-        .ok_or("LLM API key missing — add it in Settings")?;
-    let llm_key = vault
-        .load(llm_key_id)
-        .map_err(|error| error.to_string())?
-        .ok_or("bound LLM API key is missing")?;
-    let provider = build_llm(llm, &llm_key)
-        .ok_or("LLM profile is not configured; translation/editing cannot start")?;
+    else {
+        if strictly_requires_llm {
+            return Err("LLM is required for this mode; select an LLM profile in Settings".into());
+        }
+        return Ok((asr_provider, None));
+    };
+    let Some(llm_key_id) = llm.credential_id.as_deref() else {
+        if strictly_requires_llm {
+            return Err("LLM API key missing — add it in Settings".into());
+        }
+        return Ok((asr_provider, None));
+    };
+    let Some(llm_key) = vault.load(llm_key_id).map_err(|error| error.to_string())? else {
+        if strictly_requires_llm {
+            return Err("bound LLM API key is missing".into());
+        }
+        return Ok((asr_provider, None));
+    };
+    let Some(provider) = build_llm(llm, &llm_key) else {
+        if strictly_requires_llm {
+            return Err("LLM profile is not configured; translation/editing cannot start".into());
+        }
+        return Ok((asr_provider, None));
+    };
     Ok((asr_provider, Some(provider)))
 }
 
@@ -924,13 +937,31 @@ pub(crate) fn build_asr(profile: &AsrProfile, key: &str) -> Option<Arc<dyn AsrPr
             if let Some(base_url) = profile.resolved_base_url() {
                 provider = provider.with_base_url(base_url);
             }
+            if let Some(model) = profile.resolved_model() {
+                provider = provider.with_model(model);
+            }
             Some(Arc::new(provider))
         }
-        ovt_core::config::AsrEngine::OpenaiCompatible => Some(Arc::new(OpenAiCompatibleAsr::new(
-            profile.resolved_base_url()?,
-            key.to_string(),
-            profile.resolved_model()?,
-        ))),
+        ovt_core::config::AsrEngine::OpenaiCompatible => {
+            let mut provider = OpenAiCompatibleAsr::new(
+                profile.resolved_base_url()?,
+                key.to_string(),
+                profile.resolved_model()?,
+            );
+            for (key, value) in &profile.extra_options {
+                match key.as_str() {
+                    "response_format" => {
+                        provider.response_format =
+                            Some(value.trim().to_string()).filter(|value| !value.is_empty());
+                    }
+                    "send_temperature" => provider.send_temperature = value != "false",
+                    "send_language" => provider.send_language = value != "false",
+                    "send_prompt" => provider.send_prompt = value != "false",
+                    _ => {}
+                }
+            }
+            Some(Arc::new(provider))
+        }
     }
 }
 
@@ -1128,4 +1159,23 @@ pub async fn reprocess_history(
 
 fn update_tray(app: &AppHandle) {
     crate::tray::update(app);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_asr_passes_model_and_base_url_to_u2() {
+        let profile = AsrProfile {
+            id: "u2".into(),
+            label: "Unisound".into(),
+            engine: ovt_core::config::AsrEngine::UnisoundU2,
+            base_url: Some("https://maas-api.unisound.com/v1".into()),
+            model: Some("u2-asr-pro".into()),
+            ..AsrProfile::default()
+        };
+        let provider = build_asr(&profile, "test-key").expect("provider");
+        assert_eq!(provider.name(), "u2-asr");
+    }
 }

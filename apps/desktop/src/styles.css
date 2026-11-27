@@ -79,10 +79,10 @@
     --surface-sunken: 2 6 23;
     --surface-muted: 30 41 59;
     --ink: 241 245 249;
-    --body: 226 232 240;
-    --secondary: 203 213 225;
-    --muted: 148 163 184;
-    --faint: 71 85 105;
+    --text-body: 226 232 240;
+    --text-secondary: 203 213 225;
+    --text-muted: 148 163 184;
+    --text-faint: 71 85 105;
     --line: 30 41 59;
     --line-strong: 51 65 85;
     --line-hover: 100 116 139;
@@ -146,6 +146,12 @@
     border-radius: 999px;
     border: 2px solid transparent;
     background-clip: content-box;
+  }
+
+  /* Hide native Edge/WebView2 password reveal & clear buttons when custom toggle is rendered. */
+  input[type="password"]::-ms-reveal,
+  input[type="password"]::-ms-clear {
+    display: none;
   }
 }
 

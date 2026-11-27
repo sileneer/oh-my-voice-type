@@ -22,7 +22,7 @@ export function PermissionList({
         <h2 className="text-sm font-semibold">{t("permissions.title")}</h2>
         <Button type="button" variant="ghost" size="sm" onClick={onRefresh} disabled={refreshing}>
           <RefreshCw className={refreshing ? "size-4 animate-spin" : "size-4"} aria-hidden="true" />
-          {t("common.retry")}
+          {t("permissions.refresh")}
         </Button>
       </div>
       <ul className="mt-3 divide-y divide-border">

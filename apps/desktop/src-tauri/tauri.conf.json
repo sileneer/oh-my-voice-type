@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "oh-my-voice-type",
   "version": "0.1.0",
-  "identifier": "com.ovt.app",
+  "identifier": "io.github.sileneer.ohmyvoicetype",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:5173",
@@ -43,7 +43,10 @@
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgxQzBDMjk1Q0NENjhCMDIKUldRQ2k5Yk1sY0xBZ2FBWDI0Zmt3bHRyRFY3S2ZDS2hCM3VxdDlhMSt3MTVVTjNKSXF4bUYwUXUK",
       "endpoints": [
         "https://github.com/sileneer/oh-my-voice-type/releases/latest/download/latest.json"
-      ]
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   },
   "bundle": {
@@ -55,10 +58,16 @@
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ],
-    "targets": ["msi", "dmg", "app"],
+    "targets": ["nsis", "dmg", "app"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
     "macOS": {
       "entitlements": null,
-      "exceptionDomain": ""
+      "exceptionDomain": "",
+      "signingIdentity": "-"
     }
   }
 }

@@ -1,6 +1,5 @@
 //! Unisound U2-ASR adapter: asynchronous workflow
-//! `upload → create task → poll`, per https://maas.unisound.com/docs/api/overview
-//! and the SkillHub `u2-asr-pro` skill implementation.
+//! `upload → create task → poll`, per https://maas.unisound.com/docs/api/overview.
 //!
 //! Vocabulary mapping (this is the win over the Whisper-style path):
 //! - dictionary terms that fit the hotword rules (≤5 chars, ≤200 items) →
@@ -12,8 +11,8 @@
 //! payloads both surface as `Error::Provider` with the raw message preserved.
 
 use super::{
-    job_client, map_http_error, u2_wire, with_bearer, AsrCapabilities, AsrProvider,
-    TranscribeRequest, Transcript,
+    direct_job_client, format_network_error, job_client, map_http_error, send_with_proxy_fallback,
+    u2_wire, with_bearer, AsrCapabilities, AsrProvider, TranscribeRequest, Transcript,
 };
 use crate::error::{Error, Result};
 use async_trait::async_trait;
@@ -55,7 +54,18 @@ impl U2Asr {
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into().trim_end_matches('/').to_string();
+        let trimmed = base_url.into();
+        let trimmed = trimmed.trim().trim_end_matches('/');
+        self.base_url = trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string();
+        self
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        let model = model.into();
+        let trimmed = model.trim();
+        if !trimmed.is_empty() {
+            self.model = trimmed.to_string();
+        }
         self
     }
 
@@ -97,27 +107,24 @@ impl U2Asr {
     }
 
     async fn upload(&self, audio: Vec<u8>) -> Result<String> {
-        let part = reqwest::multipart::Part::bytes(audio)
-            .file_name("audio.wav")
-            .mime_str("audio/wav")
-            .map_err(|e| Error::ProviderResponse(e.to_string()))?;
-        let form = reqwest::multipart::Form::new()
-            .text("purpose", "a2t_async_input")
-            .part("file", part);
-        let resp = with_bearer(
-            self.client
-                .post(format!("{}{}", self.base_url, u2_wire::UPLOAD_PATH)),
-            &self.api_key,
-        )
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| Error::Network(format!("u2-asr upload: {e}")))?;
+        let url = format!("{}{}", self.base_url, u2_wire::UPLOAD_PATH);
+        let direct = direct_job_client();
+        let resp = send_with_proxy_fallback(&self.client, &direct, "u2-asr upload", |http| {
+            let part = reqwest::multipart::Part::bytes(audio.clone())
+                .file_name("audio.wav")
+                .mime_str("audio/wav")
+                .map_err(|e| Error::ProviderResponse(e.to_string()))?;
+            let form = reqwest::multipart::Form::new()
+                .text("purpose", "a2t_async_input")
+                .part("file", part);
+            Ok(with_bearer(http.post(&url), &self.api_key).multipart(form))
+        })
+        .await?;
         let status = resp.status();
         let text = resp
             .text()
             .await
-            .map_err(|e| Error::Network(format!("u2-asr upload body: {e}")))?;
+            .map_err(|e| Error::Network(format_network_error("u2-asr upload body", &e)))?;
         if !status.is_success() {
             return Err(map_http_error("u2-asr upload", status.as_u16(), &text));
         }
@@ -158,20 +165,17 @@ impl U2Asr {
             let bounded: String = context.chars().take(u2_wire::MAX_CONTEXT_CHARS).collect();
             payload["context"] = json!(bounded);
         }
-        let resp = with_bearer(
-            self.client
-                .post(format!("{}{}", self.base_url, u2_wire::TASK_PATH))
-                .json(&payload),
-            &self.api_key,
-        )
-        .send()
-        .await
-        .map_err(|e| Error::Network(format!("u2-asr task create: {e}")))?;
+        let url = format!("{}{}", self.base_url, u2_wire::TASK_PATH);
+        let direct = direct_job_client();
+        let resp = send_with_proxy_fallback(&self.client, &direct, "u2-asr task create", |http| {
+            Ok(with_bearer(http.post(&url).json(&payload), &self.api_key))
+        })
+        .await?;
         let status = resp.status();
         let text = resp
             .text()
             .await
-            .map_err(|e| Error::Network(format!("u2-asr task body: {e}")))?;
+            .map_err(|e| Error::Network(format_network_error("u2-asr task body", &e)))?;
         if !status.is_success() {
             return Err(map_http_error("u2-asr task", status.as_u16(), &text));
         }
@@ -199,23 +203,22 @@ impl U2Asr {
                     self.timeout.as_secs()
                 )));
             }
-            let resp = with_bearer(
-                self.client.get(format!(
-                    "{}{}/{}",
-                    self.base_url,
-                    u2_wire::TASK_PATH,
-                    url_encode(task_id)
-                )),
-                &self.api_key,
-            )
-            .send()
-            .await
-            .map_err(|e| Error::Network(format!("u2-asr poll: {e}")))?;
+            let poll_url = format!(
+                "{}{}/{}",
+                self.base_url,
+                u2_wire::TASK_PATH,
+                url_encode(task_id)
+            );
+            let direct = direct_job_client();
+            let resp = send_with_proxy_fallback(&self.client, &direct, "u2-asr poll", |http| {
+                Ok(with_bearer(http.get(&poll_url), &self.api_key))
+            })
+            .await?;
             let http_status = resp.status();
             let text = resp
                 .text()
                 .await
-                .map_err(|e| Error::Network(format!("u2-asr poll body: {e}")))?;
+                .map_err(|e| Error::Network(format_network_error("u2-asr poll body", &e)))?;
             if !http_status.is_success() {
                 return Err(map_http_error("u2-asr poll", http_status.as_u16(), &text));
             }
@@ -345,12 +348,6 @@ impl AsrProvider for U2Asr {
         let task_id = self.create_task(&file_id, &req).await?;
         let final_resp = self.poll(&task_id).await?;
         let text = join_transcript_text(&final_resp);
-        if text.is_empty() {
-            return Err(Error::ProviderResponse(format!(
-                "u2-asr task {task_id} finished without transcript text: {}",
-                final_resp.to_string().chars().take(300).collect::<String>()
-            )));
-        }
         let language = final_resp
             .get("language")
             .and_then(|l| l.as_str())
@@ -448,5 +445,13 @@ mod tests {
     fn url_encoding_escapes_reserved_chars() {
         assert_eq!(url_encode("abc-123"), "abc-123");
         assert_eq!(url_encode("a/b c"), "a%2Fb%20c");
+    }
+
+    #[test]
+    fn base_url_strips_trailing_v1_to_avoid_double_prefix() {
+        let asr = U2Asr::new("k").with_base_url("https://maas-api.unisound.com/v1/");
+        assert_eq!(asr.base_url, "https://maas-api.unisound.com");
+        let asr = asr.with_model("u2-asr-pro");
+        assert_eq!(asr.model, "u2-asr-pro");
     }
 }

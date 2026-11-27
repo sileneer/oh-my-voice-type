@@ -17,24 +17,30 @@ const items: Array<{ id: Tab; label: MessageKey; icon: LucideIcon }> = [
 export function Sidebar({
   tab,
   apiStatus,
+  activeAsrLabel,
+  activeLlmLabel,
   pendingCount,
   t,
   onNavigate,
+  onOpenProviders,
 }: {
   tab: Tab;
   apiStatus: ApiStatus;
+  activeAsrLabel?: string;
+  activeLlmLabel?: string;
   pendingCount: number;
   t: TFunc;
   onNavigate: (tab: Tab) => void;
+  onOpenProviders: () => void;
 }) {
   return (
-    <aside className="flex w-14 shrink-0 flex-col border-r border-border bg-card md:w-44 xl:w-52">
-      <div className="flex h-16 items-center gap-2.5 px-3 md:px-4">
+    <aside className="flex w-14 shrink-0 flex-col border-r border-border bg-card md:w-52 xl:w-56">
+      <div className="flex h-16 items-center gap-2.5 px-2.5 md:px-4">
         <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
           <AudioLines className="size-5" aria-hidden="true" />
         </div>
         <div className="hidden min-w-0 md:block">
-          <p className="truncate text-sm font-semibold tracking-tight">oh-my-voice-type</p>
+          <p className="truncate text-[13px] font-semibold tracking-tight" title="oh-my-voice-type">oh-my-voice-type</p>
           <p className="text-[11px] text-muted-foreground">v{packageJson.version}</p>
         </div>
       </div>
@@ -49,33 +55,44 @@ export function Sidebar({
             aria-current={tab === id ? "page" : undefined}
             title={t(label)}
             className={cn(
-              "flex h-10 items-center gap-3 rounded-md px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              // The shared Button centres its content; nav items must line up on the left.
+              "relative flex h-10 w-full items-center justify-center gap-3 rounded-md px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:justify-start",
               tab === id
-                ? "bg-secondary text-secondary-foreground"
+                ? "bg-secondary text-foreground"
                 : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
             )}
           >
             <Icon className="size-4 shrink-0" aria-hidden="true" />
             <span className="hidden md:inline">{t(label)}</span>
             {id === "history" && pendingCount > 0 && (
-              <span className="ml-auto hidden rounded-full bg-warning/15 px-2 py-0.5 text-[11px] font-semibold text-warning md:inline">
-                {pendingCount}
-              </span>
+              <>
+                <span className="ml-auto hidden rounded-full bg-warning/15 px-2 py-0.5 text-[11px] font-semibold text-warning md:inline">
+                  {pendingCount}
+                </span>
+                <span className="absolute right-2 top-2 size-2 rounded-full bg-warning md:hidden" aria-hidden="true" />
+              </>
             )}
           </Button>
         ))}
       </nav>
 
-      <div className="mt-auto hidden border-t border-border p-3 md:block">
-        <div className="flex flex-col gap-2">
-          <div className="flex items-center justify-between gap-2 text-xs">
-            <span className="text-muted-foreground">ASR</span>
-            <ReadinessBadge state={apiStatus.asr.state} t={t} compact />
-          </div>
-          <div className="flex items-center justify-between gap-2 text-xs">
-            <span className="text-muted-foreground">LLM</span>
-            <ReadinessBadge state={apiStatus.llm.state} t={t} compact />
-          </div>
+      <div className="mt-auto hidden border-t border-border p-2 md:block">
+        <div className="flex flex-col gap-0.5">
+          {([
+            ["nav.asr", apiStatus.asr.state, activeAsrLabel],
+            ["nav.llm", apiStatus.llm.state, activeLlmLabel],
+          ] as const).map(([label, state, activeLabel]) => (
+            <button
+              key={label}
+              type="button"
+              onClick={onOpenProviders}
+              title={activeLabel ? `${t(label)}: ${activeLabel} — ${t("nav.providerStatus")}` : t("nav.providerStatus")}
+              className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 rounded-md px-2 py-1.5 text-left text-xs transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <span className="text-muted-foreground">{t(label)}</span>
+              <ReadinessBadge state={state} t={t} compact />
+            </button>
+          ))}
         </div>
       </div>
     </aside>

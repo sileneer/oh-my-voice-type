@@ -1,51 +1,93 @@
 name: ci
+
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  release-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+      - run: node scripts/release.mjs check --changelog
+      - run: node --test scripts/release.test.mjs
+
   core:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy, rustfmt
-      - run: cargo fmt --check
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ci-core
+      - run: cargo fmt --all --check
       - run: cargo clippy -p ovt-core -- -D warnings
       - run: cargo test -p ovt-core
 
   desktop-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ci-desktop-windows
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
       - name: frontend
         working-directory: apps/desktop
         run: |
-          npm install --no-fund --no-audit
+          npm ci --no-fund --no-audit
           npx tsc --noEmit
+          npm test
           npm run build
       - name: host
-        run: cargo check -p ovt-desktop
+        run: |
+          cargo clippy -p ovt-desktop -- -D warnings
+          cargo test -p ovt-desktop
 
   desktop-macos:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ci-desktop-macos
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
       - name: frontend
         working-directory: apps/desktop
         run: |
-          npm install --no-fund --no-audit
+          npm ci --no-fund --no-audit
           npx tsc --noEmit
+          npm test
           npm run build
       - name: host
-        run: cargo check -p ovt-desktop
+        run: |
+          cargo clippy -p ovt-desktop -- -D warnings
+          cargo test -p ovt-desktop

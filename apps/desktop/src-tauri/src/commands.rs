@@ -3,7 +3,7 @@ use crate::config_store::{ConfigStore, ProfileRole};
 use crate::dictation;
 use crate::keys::{CredentialStore, SystemCredentialStore};
 use crate::platform::{self, HotkeyHandle};
-use ovt_core::config::{AsrProfile, CredentialRole, LlmProfile, Settings};
+use ovt_core::config::{AsrProfile, LlmProfile, Settings};
 use ovt_core::history::HistoryFilter;
 use ovt_core::providers::{CleanupRequest, TranscribeRequest};
 use serde::{Deserialize, Serialize};
@@ -226,12 +226,17 @@ pub fn updater_status() -> crate::updater::UpdaterSnapshot {
 
 #[tauri::command]
 pub async fn updater_check(app: AppHandle) -> Result<crate::updater::UpdaterSnapshot, String> {
-    Ok(crate::updater::check(&app).await)
+    Ok(crate::updater::check(&app, crate::updater::CheckKind::Manual).await)
 }
 
 #[tauri::command]
 pub async fn updater_install(app: AppHandle) -> Result<(), String> {
     crate::updater::install(&app).await
+}
+
+#[tauri::command]
+pub fn updater_restart(app: AppHandle) -> Result<(), String> {
+    crate::updater::restart(&app)
 }
 
 #[tauri::command]
@@ -454,18 +459,24 @@ pub fn api_status(state: State<'_, AppState>) -> Result<serde_json::Value, Strin
 pub fn save_asr_profile(
     state: State<'_, AppState>,
     profile: AsrProfile,
+    api_key: Option<String>,
     confirm_host_change: bool,
 ) -> Result<Settings, String> {
-    state.config.save_asr_profile(profile, confirm_host_change)
+    state
+        .config
+        .save_asr_profile(profile, api_key, confirm_host_change)
 }
 
 #[tauri::command]
 pub fn save_llm_profile(
     state: State<'_, AppState>,
     profile: LlmProfile,
+    api_key: Option<String>,
     confirm_host_change: bool,
 ) -> Result<Settings, String> {
-    state.config.save_llm_profile(profile, confirm_host_change)
+    state
+        .config
+        .save_llm_profile(profile, api_key, confirm_host_change)
 }
 
 #[tauri::command]
@@ -484,48 +495,6 @@ pub fn set_active_profile(
     id: String,
 ) -> Result<Settings, String> {
     state.config.set_active_profile(role, id)
-}
-
-#[tauri::command]
-pub fn create_credential(
-    state: State<'_, AppState>,
-    label: String,
-    role: CredentialRole,
-    key: String,
-) -> Result<Settings, String> {
-    state.config.create_credential(label, role, key)
-}
-
-#[tauri::command]
-pub fn rename_credential(
-    state: State<'_, AppState>,
-    id: String,
-    label: String,
-) -> Result<Settings, String> {
-    state.config.rename_credential(id, label)
-}
-
-#[tauri::command]
-pub fn delete_credential(state: State<'_, AppState>, id: String) -> Result<Settings, String> {
-    state.config.delete_credential(id)
-}
-
-#[tauri::command]
-pub fn replace_credential(
-    state: State<'_, AppState>,
-    id: String,
-    key: String,
-    profile_id: Option<String>,
-    replace_all: bool,
-) -> Result<Settings, String> {
-    state
-        .config
-        .replace_credential(id, key, profile_id, replace_all)
-}
-
-#[tauri::command]
-pub fn cleanup_legacy_keys(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    state.config.cleanup_legacy_keys()
 }
 
 #[tauri::command]
@@ -617,11 +586,16 @@ pub async fn test_profile(
 
     let result: Result<ProfileTestResult, String> = match mode {
         TestMode::Check => {
-            let response = ovt_core::providers::http_client()
-                .get(&base_url)
-                .send()
-                .await
-                .map_err(|e| format!("endpoint is not reachable: {e}"))?;
+            let primary = ovt_core::providers::http_client();
+            let direct = ovt_core::providers::direct_http_client();
+            let response = ovt_core::providers::send_with_proxy_fallback(
+                &primary,
+                &direct,
+                "endpoint check",
+                |http| Ok(http.get(&base_url)),
+            )
+            .await
+            .map_err(|e| format!("endpoint is not reachable: {e}"))?;
             Ok(ProfileTestResult {
                 ok: true,
                 verified: false,
@@ -658,8 +632,8 @@ pub async fn test_profile(
                         .complete(CleanupRequest {
                             system: "Connection test only.".into(),
                             user: "Reply with OK.".into(),
-                            max_tokens: 1,
-                            temperature: 0.0,
+                            max_tokens: 16,
+                            temperature: 0.2,
                         })
                         .await
                         .map(|_| "LLM test request accepted".to_string())
@@ -690,10 +664,120 @@ pub async fn test_profile(
     })
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListModelsArgs {
+    pub role: ProfileRole,
+    pub protocol: ovt_core::providers::models::ModelListProtocol,
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+    #[serde(default)]
+    pub allow_unfiltered_fallback: bool,
+    pub api_key: Option<String>,
+    pub profile_id: Option<String>,
+}
+
+fn url_host(url: &str) -> Option<String> {
+    reqwest::Url::parse(url.trim())
+        .ok()?
+        .host_str()
+        .map(|h| h.to_ascii_lowercase())
+}
+
+#[tauri::command]
+pub async fn list_models(
+    state: State<'_, AppState>,
+    args: ListModelsArgs,
+) -> Result<ovt_core::providers::models::ModelListResponse, String> {
+    use ovt_core::providers::models::{fetch_models, ModelListRequest, ModelListRole};
+
+    let settings = state.config.snapshot()?;
+    let saved_profile_info = args
+        .profile_id
+        .as_deref()
+        .and_then(|profile_id| match args.role {
+            ProfileRole::Asr => settings
+                .asr_profiles
+                .iter()
+                .find(|item| item.id == profile_id)
+                .map(|p| (p.resolved_base_url(), p.credential_id.clone())),
+            ProfileRole::Llm => settings
+                .llm_profiles
+                .iter()
+                .find(|item| item.id == profile_id)
+                .map(|p| (p.resolved_base_url(), p.credential_id.clone())),
+        });
+
+    let resolved_url = args
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| saved_profile_info.as_ref().and_then(|(url, _)| url.clone()))
+        .ok_or_else(|| "endpoint base URL is required to fetch models".to_string())?;
+
+    let key = if let Some(explicit) = args
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        explicit.to_string()
+    } else if args.profile_id.is_some() {
+        let (saved_url, credential_id) = saved_profile_info.ok_or("profile not found")?;
+        let saved_host = saved_url.as_deref().and_then(url_host);
+        let target_host = url_host(&resolved_url);
+        if saved_host != target_host {
+            return Err("enter an API key or save the new host before fetching models".into());
+        }
+        let credential_id = credential_id.ok_or("enter an API key to fetch available models")?;
+        let vault: Arc<dyn CredentialStore> = Arc::new(SystemCredentialStore);
+        vault
+            .load(&credential_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("bound API key is missing")?
+    } else {
+        return Err("enter an API key to fetch available models".into());
+    };
+
+    let request = ModelListRequest {
+        role: match args.role {
+            ProfileRole::Asr => ModelListRole::Asr,
+            ProfileRole::Llm => ModelListRole::Llm,
+        },
+        protocol: args.protocol,
+        base_url: resolved_url,
+        allow_insecure_http: args.allow_insecure_http,
+        allow_unfiltered_fallback: args.allow_unfiltered_fallback,
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        fetch_models(&request, &key),
+    )
+    .await
+    .map_err(|_| "fetching models timed out".to_string())?
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn open_settings_folder() -> Result<(), String> {
     let path = app_data_dir().display().to_string();
     open_path(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    let parsed = reqwest::Url::parse(trimmed).map_err(|_| "invalid URL".to_string())?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return Err("only https URLs can be opened externally".into());
+    }
+    use tauri_plugin_shell::ShellExt;
+    #[allow(deprecated)]
+    app.shell()
+        .open(parsed.as_str(), None)
+        .map_err(|e| e.to_string())
 }
 
 fn remove_history_audio(relative: &str) {

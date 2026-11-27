@@ -18,6 +18,7 @@ use std::time::Duration;
 
 pub mod anthropic;
 pub mod capabilities;
+pub mod models;
 pub mod openai;
 pub mod openai_responses;
 pub mod u2;
@@ -85,32 +86,106 @@ pub fn default_capabilities() -> AsrCapabilities {
     }
 }
 
-/// Common HTTP client construction (rustls, timeouts, gzip off for simplicity).
+/// Common HTTP client construction (rustls + native roots + system proxy, timeouts).
 pub fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    http_client_with_proxy(true)
+}
+
+/// Direct HTTP client with proxy disabled, used as an automatic fallback when a
+/// configured proxy is unreachable (e.g. a stopped local proxy).
+pub fn direct_http_client() -> reqwest::Client {
+    http_client_with_proxy(false)
+}
+
+fn http_client_with_proxy(use_proxy: bool) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
         .timeout(DEFAULT_TIMEOUT)
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(format!("ovt/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("reqwest client")
+        .user_agent(format!("ovt/{}", env!("CARGO_PKG_VERSION")));
+    if !use_proxy {
+        builder = builder.no_proxy();
+    }
+    builder.build().expect("reqwest client")
 }
 
 /// HTTP client for async-job providers (upload + polling can outlive the
 /// per-call request timeout, which then applies per request).
 pub fn job_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    job_client_with_proxy(true)
+}
+
+/// Direct async-job HTTP client with proxy disabled for unreachable-proxy fallback.
+pub fn direct_job_client() -> reqwest::Client {
+    job_client_with_proxy(false)
+}
+
+fn job_client_with_proxy(use_proxy: bool) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(format!("ovt/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("reqwest client")
+        .user_agent(format!("ovt/{}", env!("CARGO_PKG_VERSION")));
+    if !use_proxy {
+        builder = builder.no_proxy();
+    }
+    builder.build().expect("reqwest client")
 }
 
-pub fn map_http_error(context: &str, status: u16, _body: &str) -> Error {
+/// Returns true when `err` failed while connecting to a configured proxy
+/// (for example a stale `HTTPS_PROXY` pointing to a stopped local proxy that
+/// actively refuses TCP connections).
+pub fn is_proxy_tunnel_error(err: &reqwest::Error) -> bool {
+    if !err.is_connect() {
+        return false;
+    }
+    use std::error::Error as StdError;
+    let mut current: Option<&(dyn StdError + 'static)> = Some(err);
+    while let Some(source) = current {
+        let text = source.to_string().to_ascii_lowercase();
+        if text.contains("tunnel error") || text.contains("proxy") || text.contains("socks") {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
+/// Execute an HTTP request via `primary`, retrying once directly via `direct`
+/// (`no_proxy`) if connecting to a configured proxy fails.
+pub async fn send_with_proxy_fallback<F>(
+    primary: &reqwest::Client,
+    direct: &reqwest::Client,
+    context: &str,
+    mut build: F,
+) -> Result<reqwest::Response>
+where
+    F: FnMut(&reqwest::Client) -> Result<reqwest::RequestBuilder>,
+{
+    match build(primary)?.send().await {
+        Ok(resp) => Ok(resp),
+        Err(err) if is_proxy_tunnel_error(&err) => {
+            tracing::warn!(
+                context,
+                error = %format_network_error(context, &err),
+                "configured proxy is unreachable; retrying directly without proxy"
+            );
+            build(direct)?
+                .send()
+                .await
+                .map_err(|direct_err| Error::Network(format_network_error(context, &direct_err)))
+        }
+        Err(err) => Err(Error::Network(format_network_error(context, &err))),
+    }
+}
+
+pub fn map_http_error(context: &str, status: u16, body: &str) -> Error {
     let message = match status {
         401 | 403 => "authentication failed — check the API key".to_string(),
+        400 if looks_like_auth_error(body) => {
+            "authentication failed — check the API key".to_string()
+        }
+        404 => "endpoint not found (HTTP 404)".to_string(),
         429 => "rate limited — retry shortly".to_string(),
         500..=599 => "provider server error".to_string(),
         _ => format!("HTTP error {status}"),
@@ -119,6 +194,34 @@ pub fn map_http_error(context: &str, status: u16, _body: &str) -> Error {
         status,
         message: format!("{context}: {message}"),
     }
+}
+
+/// Some OpenAI-compatible providers (such as Google Gemini and xAI) return
+/// HTTP 400 instead of 401 when the supplied API key is invalid.
+fn looks_like_auth_error(body: &str) -> bool {
+    let lc = body.to_ascii_lowercase();
+    lc.contains("api key")
+        || lc.contains("api_key")
+        || lc.contains("apikey")
+        || lc.contains("invalid_api_key")
+        || lc.contains("unauthorized")
+        || lc.contains("authentication")
+}
+
+/// Format a `reqwest::Error` including its root cause chain (DNS, TLS, proxy,
+/// timeout, connection reset) instead of only "error sending request for url".
+pub fn format_network_error(context: &str, err: &reqwest::Error) -> String {
+    use std::error::Error as StdError;
+    let mut parts = vec![err.to_string()];
+    let mut current = err.source();
+    while let Some(source) = current {
+        let text = source.to_string();
+        if !parts.iter().any(|existing| existing.contains(&text)) {
+            parts.push(text);
+        }
+        current = source.source();
+    }
+    format!("{context}: {}", parts.join(": "))
 }
 
 /// Attach the API key to a builder.
@@ -197,6 +300,96 @@ mod tests {
         assert_eq!(response.status(), 302);
         server.join().unwrap();
     }
+
+    #[test]
+    fn http_400_with_api_key_message_maps_to_authentication_error_without_leaking_body() {
+        let gemini = map_http_error(
+            "models",
+            400,
+            r#"{"error":{"code":400,"message":"Please pass a valid API key","status":"INVALID_ARGUMENT"}}"#,
+        );
+        match gemini {
+            Error::Provider { status, message } => {
+                assert_eq!(status, 400);
+                assert!(message.contains("authentication failed"), "{message}");
+                assert!(!message.contains("INVALID_ARGUMENT"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let not_found = map_http_error("models", 404, "secret-body");
+        match not_found {
+            Error::Provider { status, message } => {
+                assert_eq!(status, 404);
+                assert!(message.contains("not found"), "{message}");
+                assert!(!message.contains("secret-body"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dead_https_proxy_falls_back_to_direct_connection() {
+        use std::io::{BufRead, BufWriter, Write};
+        use std::net::TcpListener;
+
+        // Bind then drop a listener to reserve an unused local port that refuses connections.
+        let dead_port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+
+        // Start a real target server on loopback to confirm direct fallback works.
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = target.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let mut writer = BufWriter::new(stream);
+            write!(
+                writer,
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+            )
+            .unwrap();
+            writer.flush().unwrap();
+        });
+
+        let broken_proxy_client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{dead_port}")).unwrap())
+            .connect_timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+
+        // HTTPS via dead HTTP proxy produces a tunnel connect error.
+        let https_err = broken_proxy_client
+            .get("https://example.invalid/v1/models")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            is_proxy_tunnel_error(&https_err),
+            "expected proxy tunnel error, got: {}",
+            format_network_error("test", &https_err)
+        );
+
+        // Using a fallback client recovers when primary hits a tunnel error;
+        // verify direct client reaches the target cleanly.
+        let direct = direct_http_client();
+        let resp = direct
+            .get(format!("http://{target_addr}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "ok");
+        server.join().unwrap();
+    }
 }
 
 pub struct MultipartBody {
@@ -213,8 +406,7 @@ pub fn audio_part(audio: Vec<u8>) -> Result<MultipartBody> {
     })
 }
 
-/// U2-ASR wire protocol constants (from the SkillHub skill's implementation
-/// and https://maas.unisound.com/docs/api/overview):
+/// U2-ASR wire protocol constants (per https://maas.unisound.com/docs/api/overview):
 /// - upload: `POST /v1/files/upload` (multipart, `purpose=a2t_async_input`)
 /// - task:   `POST /v1/audio/asr/tasks`
 /// - poll:   `GET  /v1/audio/asr/tasks/{task_id}`

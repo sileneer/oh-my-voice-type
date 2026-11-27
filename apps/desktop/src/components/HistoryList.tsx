@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  BookPlus, Check, ChevronDown, Copy, Download, History as HistoryIcon, LoaderCircle,
+  BookPlus, Check, ChevronRight, Copy, Download, History as HistoryIcon, LoaderCircle,
   Pin, RotateCcw, Search, Trash2, TriangleAlert, X,
 } from "lucide-react";
 import {
   api, events, type HistoryEntry, type HistoryQuery, type Mode, type PendingRecord,
 } from "../lib/api";
-import type { Locale, TFunc } from "../i18n";
+import { toast } from "sonner";
+import { localizeHotkey, type Locale, type MessageKey, type TFunc } from "../i18n";
+import { formatWhen } from "../lib/format";
 import { cn } from "../lib/utils";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -23,7 +25,7 @@ import { EmptyState } from "./app/EmptyState";
 
 const PAGE_SIZE = 50;
 
-export default function HistoryList({ locale, t }: { locale: Locale; t: TFunc }) {
+export default function HistoryList({ locale, t, hotkey = "right-alt" }: { locale: Locale; t: TFunc; hotkey?: string }) {
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
   const [pending, setPending] = useState<PendingRecord[]>([]);
   const [total, setTotal] = useState(0);
@@ -33,6 +35,7 @@ export default function HistoryList({ locale, t }: { locale: Locale; t: TFunc })
   const [pinnedOnly, setPinnedOnly] = useState(false);
   const [dateRange, setDateRange] = useState<"all" | "today" | "week">("all");
   const [loading, setLoading] = useState(true);
+  const [loaded, setLoaded] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<HistoryEntry | null>(null);
@@ -71,6 +74,7 @@ export default function HistoryList({ locale, t }: { locale: Locale; t: TFunc })
       if (id !== requestId.current) return;
       setEntries((current) => append ? [...current, ...page.entries] : page.entries);
       setTotal(page.total);
+      setLoaded(true);
     } catch (cause) {
       if (id === requestId.current) setError(String(cause));
     } finally {
@@ -92,11 +96,17 @@ export default function HistoryList({ locale, t }: { locale: Locale; t: TFunc })
     return () => { active = false; unsubscribe(); };
   }, [loadPending]);
 
+  // Action failures go to a toast; the inline banner is kept for load failures.
+  const fail = (cause: unknown) => { toast.error(String(cause)); };
   const copy = async (text: string) => {
-    try { await api.copyText(text); } catch (cause) { setError(String(cause)); }
+    try { await api.copyText(text); toast.success(t("common.copied")); } catch (cause) { fail(cause); }
   };
   const pin = async (entry: HistoryEntry) => {
-    try { await api.historyPin(entry.id, !entry.pinned); await load(); } catch (cause) { setError(String(cause)); }
+    try {
+      await api.historyPin(entry.id, !entry.pinned);
+      setEntries((current) => current.map((item) => item.id === entry.id ? { ...item, pinned: !entry.pinned } : item));
+      if (pinnedOnly) await load();
+    } catch (cause) { fail(cause); }
   };
   const confirmDelete = async () => {
     if (!deleteTarget) return;
@@ -106,7 +116,7 @@ export default function HistoryList({ locale, t }: { locale: Locale; t: TFunc })
       setDeleteTarget(null);
       setSelected(null);
       await load();
-    } catch (cause) { setError(String(cause)); }
+    } catch (cause) { fail(cause); }
   };
   const reprocess = async (entry: HistoryEntry) => {
     const entryMode: Mode = entry.mode === "translate" || entry.mode === "edit_selection" ? entry.mode : "dictate";
@@ -114,20 +124,21 @@ export default function HistoryList({ locale, t }: { locale: Locale; t: TFunc })
       await api.historyReprocess(entry.id, entryMode, entry.target_language);
       setSelected(null);
       await load();
-    } catch (cause) { setError(String(cause)); }
+    } catch (cause) { fail(cause); }
   };
   const addDictionary = async () => {
     if (!dictionaryTerm.trim()) return;
-    try { await api.dictionaryAdd(dictionaryTerm.trim()); setDictionaryOpen(false); setDictionaryTerm(""); } catch (cause) { setError(String(cause)); }
+    try { await api.dictionaryAdd(dictionaryTerm.trim()); setDictionaryOpen(false); setDictionaryTerm(""); } catch (cause) { fail(cause); }
   };
   const retryPending = async (record: PendingRecord) => {
-    try { await api.pendingRetry(record.id); await loadPending(); } catch (cause) { setError(String(cause)); }
+    try { await api.pendingRetry(record.id); await loadPending(); } catch (cause) { fail(cause); }
   };
   const discardPending = async () => {
     if (!discardTarget) return;
-    try { await api.pendingDiscard(discardTarget.id); setDiscardTarget(null); await loadPending(); } catch (cause) { setError(String(cause)); }
+    try { await api.pendingDiscard(discardTarget.id); setDiscardTarget(null); await loadPending(); } catch (cause) { fail(cause); }
   };
   const clearFilters = () => { setQuery(""); setMode("all"); setDelivery("all"); setPinnedOnly(false); setDateRange("all"); };
+  const filtered = query.trim() !== "" || mode !== "all" || delivery !== "all" || pinnedOnly || dateRange !== "all";
 
   return (
     <>
@@ -158,9 +169,9 @@ export default function HistoryList({ locale, t }: { locale: Locale; t: TFunc })
             </Button>
           </div>
         </div>
-        <div className="mt-3 flex items-center justify-between gap-3 text-xs text-muted-foreground">
-          <span>{total === 1 ? t("history.count.one") : t("history.count.other", { n: total })}</span>
-          <Button type="button" variant="link" size="sm" onClick={clearFilters}><X className="size-3.5" aria-hidden="true" />{t("common.clearFilters")}</Button>
+        <div className="mt-3 flex min-h-8 items-center justify-between gap-3 text-xs text-muted-foreground">
+          <span aria-live="polite">{loaded ? (total === 1 ? t("history.count.one") : t("history.count.other", { n: total })) : ""}</span>
+          {filtered && <Button type="button" variant="link" size="sm" onClick={clearFilters}><X className="size-3.5" aria-hidden="true" />{t("common.clearFilters")}</Button>}
         </div>
       </div>
 
@@ -175,7 +186,7 @@ export default function HistoryList({ locale, t }: { locale: Locale; t: TFunc })
                 <TriangleAlert className="size-4 shrink-0 text-warning" aria-hidden="true" />
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-medium">{record.final_text || record.raw_text || t("history.notInserted")}</p>
-                  <p className="mt-0.5 text-xs text-muted-foreground">{new Date(record.created_at_ms).toLocaleString(locale)} · {t("history.pendingStage", { stage: record.stage })}</p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">{formatWhen(record.created_at_ms, locale)} · {t("history.pendingStage", { stage: stageLabel(record.stage, t) })}</p>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
                   <Button type="button" variant="outline" size="sm" onClick={() => void retryPending(record)}><RotateCcw className="size-4" aria-hidden="true" />{t("history.pendingRetry")}</Button>
@@ -192,25 +203,25 @@ export default function HistoryList({ locale, t }: { locale: Locale; t: TFunc })
         {loading ? (
           <div className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground" role="status"><LoaderCircle className="size-4 animate-spin" aria-hidden="true" />{t("history.loading")}</div>
         ) : entries.length === 0 ? (
-          <EmptyState icon={HistoryIcon} title={t("history.emptyFiltered")} description={t("history.empty")} action={<Button type="button" variant="outline" size="sm" onClick={clearFilters}>{t("common.clearFilters")}</Button>} />
+          filtered
+            ? <EmptyState icon={Search} title={t("history.emptyFiltered")} description={t("history.emptyFilteredHint")} action={<Button type="button" variant="outline" size="sm" onClick={clearFilters}>{t("common.clearFilters")}</Button>} />
+            : <EmptyState icon={HistoryIcon} title={t("history.emptyTitle")} description={t("history.empty", { hotkey: localizeHotkey(locale, hotkey) })} />
         ) : (
           <ul className="flex flex-col gap-2">
             {entries.map((entry) => (
-              <li key={entry.id} className="rounded-lg border border-border bg-card p-4 transition-colors hover:border-input">
-                <Button type="button" variant="ghost" onClick={() => setSelected(entry)} className="block h-auto w-full whitespace-normal rounded-none p-0 text-left hover:bg-transparent">
+              <li key={entry.id} className={cn("rounded-lg border bg-card p-4 transition-colors hover:border-input", entry.pinned ? "border-primary/30" : "border-border")}>
+                <Button type="button" variant="ghost" onClick={() => setSelected(entry)} className="block h-auto w-full whitespace-normal rounded-none p-0 text-left font-normal hover:bg-transparent">
                   <p className="line-clamp-3 whitespace-pre-wrap text-sm leading-relaxed text-secondary-foreground">{entry.final_text || entry.raw_text}</p>
-                  <div className="mt-3 flex flex-wrap items-center gap-2">
-                    <Badge variant="secondary">{modeLabel(entry.mode, t)}</Badge>
-                    <span className="text-xs text-muted-foreground">{new Date(entry.created_at_ms).toLocaleString(locale)}</span>
-                    {entry.app_name && <span className="text-xs text-muted-foreground">· {entry.app_name}</span>}
-                    {entry.pinned && <Badge variant="outline"><Pin className="size-3" aria-hidden="true" />{t("history.pinned")}</Badge>}
-                    <DeliveryBadge entry={entry} t={t} />
-                  </div>
                 </Button>
-                <div className="mt-3 flex flex-wrap justify-end gap-1.5 border-t border-border pt-3">
-                  <Button type="button" variant="ghost" size="sm" onClick={() => void copy(entry.final_text || entry.raw_text)}><Copy className="size-4" aria-hidden="true" />{t("history.copy")}</Button>
-                  <Button type="button" variant="ghost" size="sm" onClick={() => void pin(entry)}><Pin className="size-4" aria-hidden="true" />{t(entry.pinned ? "history.unpin" : "history.pin")}</Button>
-                  <Button type="button" variant="ghost" size="sm" onClick={() => setSelected(entry)}><ChevronDown className="size-4" aria-hidden="true" />{t("common.details")}</Button>
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <Badge variant="secondary">{modeLabel(entry.mode, t)}</Badge>
+                  <span className="text-xs text-muted-foreground">{formatWhen(entry.created_at_ms, locale)}{entry.app_name ? ` · ${entry.app_name}` : ""}</span>
+                  <DeliveryBadge entry={entry} t={t} />
+                  <div className="ml-auto flex items-center gap-0.5">
+                    <Button type="button" variant="ghost" size="sm" onClick={() => void copy(entry.final_text || entry.raw_text)}><Copy className="size-4" aria-hidden="true" />{t("history.copy")}</Button>
+                    <Button type="button" variant="ghost" size="icon" className={cn("size-8", entry.pinned && "text-primary")} onClick={() => void pin(entry)} aria-pressed={entry.pinned} aria-label={t(entry.pinned ? "history.unpin" : "history.pin")} title={t(entry.pinned ? "history.unpin" : "history.pin")}><Pin className={cn("size-4", entry.pinned && "fill-current")} aria-hidden="true" /></Button>
+                    <Button type="button" variant="ghost" size="icon" className="size-8" onClick={() => setSelected(entry)} aria-label={t("common.details")} title={t("common.details")}><ChevronRight className="size-4" aria-hidden="true" /></Button>
+                  </div>
                 </div>
               </li>
             ))}
@@ -227,7 +238,7 @@ export default function HistoryList({ locale, t }: { locale: Locale; t: TFunc })
         onCopy={(text) => void copy(text)}
         onDelete={(entry) => setDeleteTarget(entry)}
         onReprocess={(entry) => void reprocess(entry)}
-        onExportAudio={(id) => void api.historyExportAudio(id).catch((cause) => setError(String(cause)))}
+        onExportAudio={(id) => void api.historyExportAudio(id).catch(fail)}
         onAddDictionary={() => { setDictionaryTerm(selected?.final_text.slice(0, 80) ?? ""); setDictionaryOpen(true); }}
       />
 
@@ -268,7 +279,7 @@ function HistoryDetailSheet({ entry, locale, t, onClose, onCopy, onDelete, onRep
   return (
     <Sheet open={entry !== null} onOpenChange={(open) => !open && onClose()}>
       <SheetContent className="w-full overflow-y-auto sm:max-w-lg">
-        {entry && <SheetHeader><SheetTitle>{t("common.details")}</SheetTitle><SheetDescription>{new Date(entry.created_at_ms).toLocaleString(locale)} · {modeLabel(entry.mode, t)}</SheetDescription></SheetHeader>}
+        {entry && <SheetHeader><SheetTitle>{t("common.details")}</SheetTitle><SheetDescription>{new Date(entry.created_at_ms).toLocaleString(locale)} · {modeLabel(entry.mode, t)}{entry.app_name ? ` · ${entry.app_name}` : ""}</SheetDescription></SheetHeader>}
         {entry && <div className="mt-6 space-y-5">
           <DetailBlock title={t("history.final")} text={entry.final_text || entry.raw_text} />
           {entry.raw_text && entry.raw_text !== entry.final_text && <DetailBlock title={t("history.raw")} text={entry.raw_text} />}
@@ -304,6 +315,24 @@ function DeliveryBadge({ entry, t }: { entry: HistoryEntry; t: TFunc }) {
 
 function FilterSelect({ value, onChange, label, options }: { value: string; onChange: (value: string) => void; label: string; options: Array<[string, string]> }) {
   return <Select value={value} onValueChange={onChange}><SelectTrigger className="h-9 min-w-36" aria-label={label}><SelectValue /></SelectTrigger><SelectContent>{options.map(([id, text]) => <SelectItem key={id} value={id}>{text}</SelectItem>)}</SelectContent></Select>;
+}
+
+const stageKeys: Record<string, MessageKey> = {
+  capturing: "pending.stage.capturing",
+  queued: "pending.stage.queued",
+  transcribing: "pending.stage.transcribing",
+  rewriting: "pending.stage.rewriting",
+  needs_delivery: "pending.stage.needs_delivery",
+  delivering: "pending.stage.delivering",
+  completed: "pending.stage.completed",
+  failed: "pending.stage.failed",
+  interrupted: "pending.stage.interrupted",
+  needs_review: "pending.stage.needs_review",
+};
+
+function stageLabel(stage: string, t: TFunc) {
+  const key = stageKeys[stage];
+  return key ? t(key) : stage.replace(/_/g, " ");
 }
 
 function modeLabel(mode: string, t: TFunc) {

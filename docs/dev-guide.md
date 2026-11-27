@@ -19,9 +19,11 @@
   - `audio.rs`: dedicated audio thread; `AudioHandle` is `Clone + Send + Sync` and channels commands (WASAPI streams can't cross threads).
 
 ## Adding a provider
+
 1. Implement `AsrProvider` or `LlmProvider` in `providers/`.
 2. Map its capability flags (hotwords? prompt? streaming?) in the request builder.
 3. Add a contract test with recorded fixtures; wire selection in `dictation::build_*`.
+4. If it uses a supported wire protocol, add a preset in `apps/desktop/src/lib/provider-presets.ts` with its endpoint, default model, and key page. API keys stay in the OS vault and are owned by the provider profile.
 
 ## Prompt contract
 Prompts are product surface; changes require golden test updates in `crates/ovt-core/tests/pipeline.rs` (mock providers assert content) and manual quality checks with a real provider. Rules to preserve:
@@ -48,4 +50,4 @@ Prompts are product surface; changes require golden test updates in `crates/ovt-
 - [ ] macOS: CGEvent tap + AX permissions prompt verified on a Mac
 - [ ] Windows: test apps matrix (Slack, Chrome, Word, VS Code, Notepad, Windows Terminal)
 - [ ] p90 latency logged via `session:outcome` timings on 20 dictations
-- [ ] Installers: `npm run tauri build` (msi/dmg), notarize/sign
+- [ ] Installers and updater: `node scripts/release.mjs <version> --push` (see README → Releases and updates); Windows code signing and macOS notarization still to do

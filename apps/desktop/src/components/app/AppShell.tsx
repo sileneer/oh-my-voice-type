@@ -6,16 +6,22 @@ import { Sidebar } from "./Sidebar";
 export function AppShell({
   tab,
   apiStatus,
+  activeAsrLabel,
+  activeLlmLabel,
   pendingCount,
   t,
   onNavigate,
+  onOpenProviders,
   children,
 }: {
   tab: "home" | "history" | "settings";
   apiStatus: ApiStatus;
+  activeAsrLabel?: string;
+  activeLlmLabel?: string;
   pendingCount: number;
   t: TFunc;
   onNavigate: (tab: "home" | "history" | "settings") => void;
+  onOpenProviders: () => void;
   children: ReactNode;
 }) {
   return (
@@ -23,9 +29,12 @@ export function AppShell({
       <Sidebar
         tab={tab}
         apiStatus={apiStatus}
+        activeAsrLabel={activeAsrLabel}
+        activeLlmLabel={activeLlmLabel}
         pendingCount={pendingCount}
         t={t}
         onNavigate={onNavigate}
+        onOpenProviders={onOpenProviders}
       />
       <main className="min-w-0 flex-1 overflow-auto" id="main-content">
         <div className="mx-auto w-full max-w-[860px] px-5 py-7 md:px-8 md:py-9">{children}</div>
