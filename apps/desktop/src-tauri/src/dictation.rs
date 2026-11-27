@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 type SessionProviders = (Arc<dyn AsrProvider>, Option<Arc<dyn LlmProvider>>);
@@ -177,35 +177,50 @@ pub fn start(app: &AppHandle, request: SessionRequest) -> ovt_core::Result<Sessi
 
     let token = CancellationToken::new();
     let (tx, rx) = mpsc::unbounded_channel();
-    let (ready_tx, ready_rx) = oneshot::channel();
     let app_for_task = app.clone();
     let meta_for_task = meta.clone();
     let token_for_task = token.clone();
-    let handle = tauri::async_runtime::spawn(async move {
-        let _ = ready_tx.send(());
-        run_session(
-            app_for_task,
-            rx,
-            meta_for_task,
-            request.mode,
-            target_language,
-            target,
-            settings,
-            providers,
-            token_for_task,
-        )
-        .await;
-    });
-    let _ = ready_rx.blocking_recv();
-    *lock_active() = Some(ActiveSession {
-        meta: meta.clone(),
-        phase: Phase::Starting,
-        token: token.clone(),
-        handle,
-        commands: tx,
-    });
-    platform::set_session_active(true);
-    emit_state(app, "starting", &meta, None);
+    {
+        // Register the session and spawn its task under one lock. The task can
+        // fail (and call `finish_active`) immediately, so it must never run
+        // before it is registered, and two concurrent starts must not both
+        // pass the `is_some` check. Never block on the task here: hotkey and
+        // tray starts used to run inside the async runtime, where the old
+        // `blocking_recv` panicked after the capture had already started.
+        let mut active = lock_active();
+        if active.is_some() {
+            drop(active);
+            let _ = pending.delete(&pending_id);
+            notify_pending(app);
+            return Err(ovt_core::Error::Config(
+                "another voice session is already active".into(),
+            ));
+        }
+        // Emitted before the task exists so "recording" can never overtake it.
+        emit_state(app, "starting", &meta, None);
+        let handle = tauri::async_runtime::spawn(async move {
+            run_session(
+                app_for_task,
+                rx,
+                meta_for_task,
+                request.mode,
+                target_language,
+                target,
+                settings,
+                providers,
+                token_for_task,
+            )
+            .await;
+        });
+        *active = Some(ActiveSession {
+            meta: meta.clone(),
+            phase: Phase::Starting,
+            token,
+            handle,
+            commands: tx,
+        });
+        platform::set_session_active(true);
+    }
     let area = platform::target_work_area();
     pill_show(app, area);
     update_tray(app);
@@ -838,41 +853,109 @@ pub fn install_hotkey(app: &AppHandle) -> ovt_core::Result<()> {
         if key.trim().is_empty() {
             continue;
         }
-        let app_for_callback = app.clone();
-        let target_language = settings.dictation.translate_target.clone();
+        let events = spawn_hotkey_worker(
+            app.clone(),
+            mode,
+            settings.dictation.translate_target.clone(),
+        )?;
         let handle = listener.start(
             &key,
             settings.hotkey.smart_gestures,
-            Box::new(move |event| match event {
-                ovt_core::hotkey::HotkeyEvent::Start => {
-                    let app = app_for_callback.clone();
-                    let language = target_language.clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(error) = start(
-                            &app,
-                            SessionRequest {
-                                mode,
-                                target_language: Some(language),
-                                source: SessionSource::Hotkey,
-                            },
-                        ) {
-                            let _ = app.emit(
-                                "session:error",
-                                serde_json::json!({ "message": error.to_string() }),
-                            );
-                        }
-                    });
-                }
-                ovt_core::hotkey::HotkeyEvent::Stop => {
-                    let _ = request_stop(&app_for_callback);
-                }
-                ovt_core::hotkey::HotkeyEvent::Cancel => cancel(&app_for_callback),
-                ovt_core::hotkey::HotkeyEvent::PassThrough => {}
+            Box::new(move |event| {
+                let _ = events.send(event);
             }),
         )?;
         slot.push(handle);
     }
     Ok(())
+}
+
+/// One ordered worker per activation key. The OS hook callback only enqueues
+/// (it must return within the hook timeout), and processing events in order
+/// guarantees a quick Stop or chord can never overtake the Start that created
+/// the session. `start` blocks (keychain, UI Automation), so it must run on a
+/// plain thread rather than an async worker. The thread exits when the hook
+/// handle, and with it the sender, is dropped on reinstall.
+fn spawn_hotkey_worker(
+    app: AppHandle,
+    mode: SessionMode,
+    target_language: String,
+) -> ovt_core::Result<std::sync::mpsc::Sender<ovt_core::hotkey::HotkeyEvent>> {
+    use ovt_core::hotkey::HotkeyEvent;
+    let (tx, rx) = std::sync::mpsc::channel::<HotkeyEvent>();
+    std::thread::Builder::new()
+        .name("ovt-hotkey-actions".into())
+        .spawn(move || {
+            // The session this key started, so its Stop/chord never ends a
+            // session that a different key or the UI started.
+            let mut owned: Option<String> = None;
+            for event in rx {
+                match event {
+                    HotkeyEvent::Start => {
+                        match start(
+                            &app,
+                            SessionRequest {
+                                mode,
+                                target_language: Some(target_language.clone()),
+                                source: SessionSource::Hotkey,
+                            },
+                        ) {
+                            Ok(started) => owned = Some(started.session_id),
+                            Err(error) => {
+                                owned = None;
+                                let _ = app.emit(
+                                    "session:error",
+                                    serde_json::json!({ "message": error.to_string() }),
+                                );
+                            }
+                        }
+                    }
+                    HotkeyEvent::Stop => {
+                        if let Some(id) = owned.take() {
+                            request_stop_session(&id);
+                        }
+                    }
+                    HotkeyEvent::Cancel => {
+                        owned = None;
+                        cancel(&app);
+                    }
+                    // The activation key was part of a chord (e.g. Alt+Tab): the
+                    // decoder dropped the take, so drop the session it started;
+                    // otherwise it keeps recording with no key left to stop it.
+                    HotkeyEvent::PassThrough => {
+                        if let Some(id) = owned.take() {
+                            cancel_recording_session(&app, &id);
+                        }
+                    }
+                }
+            }
+        })
+        .map_err(|error| {
+            ovt_core::Error::Unsupported(format!("cannot start hotkey worker: {error}"))
+        })?;
+    Ok(tx)
+}
+
+fn request_stop_session(session_id: &str) {
+    let active = lock_active();
+    if let Some(session) = active.as_ref() {
+        if session.meta.id == session_id && session.phase != Phase::Processing {
+            let _ = session.commands.send(RecordingCmd::Stop);
+        }
+    }
+}
+
+fn cancel_recording_session(app: &AppHandle, session_id: &str) {
+    let mut active = lock_active();
+    let Some(session) = active.as_mut() else {
+        return;
+    };
+    if session.meta.id != session_id || session.phase == Phase::Processing {
+        return;
+    }
+    emit_state(app, "cancelling", &session.meta, None);
+    session.token.cancel();
+    let _ = session.commands.send(RecordingCmd::Cancel);
 }
 
 pub fn reload_hotkey(app: &AppHandle) -> ovt_core::Result<()> {

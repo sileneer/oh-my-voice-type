@@ -43,8 +43,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, PostThreadMessageW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, MSG,
-    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT,
+    LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 pub use super::{ContextProvider, TargetInfo, TextInserter};
@@ -589,6 +589,41 @@ struct HookCtx {
     vk: u16,
     decoder: GestureDecoder,
     callback: HotkeyCallback,
+    /// The activation key is physically down (used to skip auto-repeat).
+    key_down: bool,
+}
+
+/// `VK_LMENU` / `VK_RMENU`. A lone Alt press and release activates the menu bar
+/// of the focused app, which then swallows the synthesized paste.
+fn is_alt_vk(vk: u16) -> bool {
+    matches!(vk, 0xA4 | 0xA5)
+}
+
+/// Unassigned virtual key (the same "menu mask" key AutoHotkey uses). Tapping
+/// it while Alt is down makes Windows treat the Alt press as a chord, so no
+/// menu activation happens on release.
+const VK_MENU_MASK: u16 = 0xE8;
+
+/// AltGr layouts synthesize an `LCtrl` edge with this scan code around every
+/// Right Alt edge; it is not a real chord key.
+const ALTGR_FAKE_LCTRL_SCAN: u32 = 0x21D;
+
+fn is_ignored_hook_event(kb: &KBDLLHOOKSTRUCT) -> bool {
+    // Our own SendInput (paste keystrokes, the menu mask) must not reach the
+    // gesture decoder, where it would look like a chord and cancel the take.
+    let injected = kb.flags.0 & LLKHF_INJECTED.0 != 0;
+    let altgr_ctrl = kb.vkCode == 0xA2 && kb.scanCode == ALTGR_FAKE_LCTRL_SCAN;
+    injected || altgr_ctrl
+}
+
+fn send_menu_mask() {
+    let inputs = [
+        key_input(VK_MENU_MASK, false),
+        key_input(VK_MENU_MASK, true),
+    ];
+    unsafe {
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
 }
 
 fn run_hotkey_thread(
@@ -602,6 +637,7 @@ fn run_hotkey_thread(
         vk,
         decoder: GestureDecoder::new(threshold, smart),
         callback,
+        key_down: false,
     }));
     CTX.with(|slot| {
         *slot.borrow_mut() = Some(ctx.clone());
@@ -631,6 +667,9 @@ thread_local! {
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        if is_ignored_hook_event(kb) {
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
         if kb.vkCode == 0x1B && SESSION_ACTIVE.load(Ordering::SeqCst) {
             let ctx_opt = CTX.with(|slot| slot.borrow().clone());
             if let Some(ctx_arc) = ctx_opt {
@@ -651,6 +690,12 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             if let Some(ctx_arc) = ctx_opt {
                 if let Ok(mut ctx) = ctx_arc.lock() {
                     let is_target = kb.vkCode == u32::from(ctx.vk);
+                    if is_target && edge == Edge::Down && !ctx.key_down && is_alt_vk(ctx.vk) {
+                        send_menu_mask();
+                    }
+                    if is_target {
+                        ctx.key_down = edge == Edge::Down;
+                    }
                     let event = if is_target {
                         ctx.decoder.on_edge(edge, Instant::now())
                     } else if edge == Edge::Down {
@@ -698,6 +743,33 @@ mod tests {
         assert_eq!(parse_hotkey_key("right-ctrl"), Some(0xA3));
         assert_eq!(parse_hotkey_key("F8"), Some(0x77));
         assert_eq!(parse_hotkey_key("nope"), None);
+    }
+
+    #[test]
+    fn injected_and_altgr_events_are_ignored() {
+        let event = |vk: u32, scan: u32, flags: u32| KBDLLHOOKSTRUCT {
+            vkCode: vk,
+            scanCode: scan,
+            flags: windows::Win32::UI::WindowsAndMessaging::KBDLLHOOKSTRUCT_FLAGS(flags),
+            ..KBDLLHOOKSTRUCT::default()
+        };
+        // Our own Ctrl+V and menu-mask keystrokes.
+        assert!(is_ignored_hook_event(&event(0x56, 0x2F, LLKHF_INJECTED.0)));
+        assert!(is_ignored_hook_event(&event(
+            u32::from(VK_MENU_MASK),
+            0,
+            LLKHF_INJECTED.0
+        )));
+        // AltGr's synthesized left Ctrl.
+        assert!(is_ignored_hook_event(&event(
+            0xA2,
+            ALTGR_FAKE_LCTRL_SCAN,
+            0
+        )));
+        // A real left Ctrl or letter is a genuine chord key.
+        assert!(!is_ignored_hook_event(&event(0xA2, 0x1D, 0)));
+        assert!(!is_ignored_hook_event(&event(0x41, 0x1E, 0)));
+        assert!(is_alt_vk(0xA5) && is_alt_vk(0xA4) && !is_alt_vk(0xA3));
     }
 
     #[test]

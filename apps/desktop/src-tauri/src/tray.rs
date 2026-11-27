@@ -183,7 +183,10 @@ fn handle_update(app: &AppHandle) {
 
 fn spawn_start(app: &AppHandle, mode: SessionMode) {
     let app = app.clone();
-    tauri::async_runtime::spawn(async move {
+    // `start` is synchronous and blocks (keychain, UI Automation); running it
+    // inside an async task panicked. Keep it off the main thread as well so
+    // the tray menu stays responsive.
+    tauri::async_runtime::spawn_blocking(move || {
         let target_language = app
             .try_state::<crate::commands::AppState>()
             .and_then(|state| state.config.snapshot().ok())

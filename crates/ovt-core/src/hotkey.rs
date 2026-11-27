@@ -101,9 +101,11 @@ impl GestureDecoder {
                     self.state = State::Idle;
                     Some(HotkeyEvent::Stop)
                 } else {
-                    // quick tap in smart mode: keep recording, latched
+                    // Quick tap in smart mode: the take that started on Down keeps
+                    // recording, latched. Emitting a second Start here made hosts
+                    // try to open a second session on every tap.
                     self.state = State::Latched;
-                    Some(HotkeyEvent::Start)
+                    None
                 }
             }
             (Edge::Up, _) => None,
@@ -132,10 +134,7 @@ mod tests {
         let mut d = GestureDecoder::default();
         let t0 = Instant::now();
         assert_eq!(d.on_edge(Edge::Down, t0), Some(HotkeyEvent::Start));
-        assert_eq!(
-            d.on_edge(Edge::Up, t0 + Duration::from_millis(100)),
-            Some(HotkeyEvent::Start)
-        );
+        assert_eq!(d.on_edge(Edge::Up, t0 + Duration::from_millis(100)), None);
         assert_eq!(d.on_edge(Edge::Down, t(10)), Some(HotkeyEvent::Stop));
         assert_eq!(d.on_edge(Edge::Up, t(30)), None);
         assert!(d.is_idle());
@@ -169,11 +168,31 @@ mod tests {
         let mut d = GestureDecoder::toggle();
         let t0 = Instant::now();
         assert_eq!(d.on_edge(Edge::Down, t0), Some(HotkeyEvent::Start));
-        assert_eq!(
-            d.on_edge(Edge::Up, t0 + Duration::from_millis(50)),
-            Some(HotkeyEvent::Start)
-        );
+        assert_eq!(d.on_edge(Edge::Up, t0 + Duration::from_millis(50)), None);
         assert_eq!(d.on_edge(Edge::Down, t(100)), Some(HotkeyEvent::Stop));
+    }
+
+    #[test]
+    fn each_take_emits_exactly_one_start() {
+        for mut d in [
+            GestureDecoder::default(),
+            GestureDecoder::new(Duration::from_millis(350), false),
+            GestureDecoder::toggle(),
+        ] {
+            let t0 = Instant::now();
+            let mut events = vec![d.on_edge(Edge::Down, t0)];
+            events.push(d.on_edge(Edge::Down, t0 + Duration::from_millis(30)));
+            events.push(d.on_edge(Edge::Up, t0 + Duration::from_millis(80)));
+            events.push(d.on_edge(Edge::Down, t0 + Duration::from_millis(900)));
+            events.push(d.on_edge(Edge::Up, t0 + Duration::from_millis(950)));
+            let starts = events
+                .iter()
+                .filter(|event| **event == Some(HotkeyEvent::Start))
+                .count();
+            assert!(starts <= 2, "{events:?}");
+            assert_eq!(events[0], Some(HotkeyEvent::Start));
+            assert_ne!(events[2], Some(HotkeyEvent::Start), "{events:?}");
+        }
     }
 
     #[test]
