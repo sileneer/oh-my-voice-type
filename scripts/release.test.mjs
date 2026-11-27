@@ -17,6 +17,16 @@ import { extractChangelogSection, nextVersion } from "./release.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+// Strip GitHub Actions tag/output env vars so tests behave identically when
+// triggered by a release tag push.
+const cleanEnv = Object.fromEntries(
+  Object.entries(process.env).filter(
+    ([key]) => key !== "GITHUB_REF_TYPE" && key !== "GITHUB_REF_NAME" && key !== "GITHUB_OUTPUT",
+  ),
+);
+const runRelease = (cwd, args, extra = {}) =>
+  execFileSync("node", ["scripts/release.mjs", ...args], { cwd, encoding: "utf8", env: cleanEnv, ...extra }).trim();
+
 function makeMinisignPair() {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const spki = publicKey.export({ format: "der", type: "spki" });
@@ -240,9 +250,9 @@ function setupTempRepo(extraChangelog = "") {
 test("release.mjs tag tags current version without modifying files", () => {
   const { work, git } = setupTempRepo();
   try {
-    const before = execFileSync("node", ["scripts/release.mjs", "check", "--changelog"], { cwd: work, encoding: "utf8" }).trim();
+    const before = runRelease(work, ["check", "--changelog"]);
     const headBefore = git("rev-parse", "HEAD");
-    execFileSync("node", ["scripts/release.mjs", "tag"], { cwd: work, encoding: "utf8" });
+    runRelease(work, ["tag"]);
     assert.equal(git("rev-parse", "HEAD"), headBefore);
     assert.equal(git("tag", "--list"), `v${before}`);
     assert.equal(git("status", "--porcelain"), "");
@@ -252,7 +262,7 @@ test("release.mjs tag tags current version without modifying files", () => {
 });
 
 test("release.mjs bumps every manifest, enforces changelog/branch/remote sync, commits and tags", () => {
-  const current = execFileSync("node", ["scripts/release.mjs", "check"], { cwd: root, encoding: "utf8" }).trim();
+  const current = runRelease(root, ["check"]);
   const expected = nextVersion(current, "minor");
   const { work, git } = setupTempRepo(`## [${expected}] - 2026-12-01\n\n- Added release checks.`);
   const bare = mkdtempSync(join(tmpdir(), "ovt-origin-"));
@@ -263,14 +273,14 @@ test("release.mjs bumps every manifest, enforces changelog/branch/remote sync, c
 
     // Refuses when changelog entry is missing for a different version
     assert.throws(
-      () => execFileSync("node", ["scripts/release.mjs", "patch"], { cwd: work, stdio: "pipe" }),
+      () => runRelease(work, ["patch"], { stdio: "pipe" }),
       /CHANGELOG\.md has no section/,
     );
 
     // Refuses on a non-main branch
     git("checkout", "-q", "-b", "feature/test");
     assert.throws(
-      () => execFileSync("node", ["scripts/release.mjs", "minor"], { cwd: work, stdio: "pipe" }),
+      () => runRelease(work, ["minor"], { stdio: "pipe" }),
       /Releases must be cut from main/,
     );
     git("checkout", "-q", "main");
@@ -280,15 +290,15 @@ test("release.mjs bumps every manifest, enforces changelog/branch/remote sync, c
     git("add", "unpushed.txt");
     git("commit", "-q", "-m", "ahead");
     assert.throws(
-      () => execFileSync("node", ["scripts/release.mjs", "minor"], { cwd: work, stdio: "pipe" }),
+      () => runRelease(work, ["minor"], { stdio: "pipe" }),
       /not synced with origin\/main/,
     );
     git("push", "-q", "origin", "main");
 
     // Succeeds once synced on main with CHANGELOG entry
-    execFileSync("node", ["scripts/release.mjs", "minor"], { cwd: work, encoding: "utf8" });
+    runRelease(work, ["minor"]);
 
-    assert.equal(execFileSync("node", ["scripts/release.mjs", "check"], { cwd: work, encoding: "utf8" }).trim(), expected);
+    assert.equal(runRelease(work, ["check"]), expected);
     assert.equal(git("tag", "--list"), `v${expected}`);
     assert.equal(git("log", "-1", "--format=%s"), `Release v${expected}`);
     assert.equal(git("status", "--porcelain"), "");
@@ -302,7 +312,7 @@ test("release.mjs bumps every manifest, enforces changelog/branch/remote sync, c
     assert.match(readFileSync(join(work, "apps/desktop/src-tauri/tauri.conf.json"), "utf8"), new RegExp(`"version": "${expected}"`));
 
     writeFileSync(join(work, "Cargo.toml"), readFileSync(join(work, "Cargo.toml"), "utf8").replace(expected, "9.9.9"));
-    assert.throws(() => execFileSync("node", ["scripts/release.mjs", "check"], { cwd: work, stdio: "pipe" }), /Version mismatch/);
+    assert.throws(() => runRelease(work, ["check"], { stdio: "pipe" }), /Version mismatch/);
   } finally {
     rmSync(work, { recursive: true, force: true });
     rmSync(bare, { recursive: true, force: true });

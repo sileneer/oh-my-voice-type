@@ -85,7 +85,7 @@ export function readChangelogNotes(version, path = changelogPath) {
   return extractChangelogSection(read(path), version);
 }
 
-function check({ requireChangelog = false } = {}) {
+function check({ requireChangelog = false, checkTag = true } = {}) {
   const versions = readVersions();
   const unique = [...new Set(Object.values(versions))];
   if (unique.length !== 1 || !unique[0]) {
@@ -93,7 +93,7 @@ function check({ requireChangelog = false } = {}) {
     throw new Error(`Version mismatch:\n${lines.join("\n")}\nRun: node scripts/release.mjs <version>`);
   }
   const version = unique[0];
-  const tag = process.env.GITHUB_REF_TYPE === "tag" ? process.env.GITHUB_REF_NAME : undefined;
+  const tag = checkTag && process.env.GITHUB_REF_TYPE === "tag" ? process.env.GITHUB_REF_NAME : undefined;
   if (tag && tag !== `v${version}`) {
     throw new Error(`Tag ${tag} does not match app version v${version}`);
   }
@@ -252,7 +252,7 @@ function bump(target, { push, dryRun, runCheck, allowBranch }) {
   if (runCheck) runLocalChecks();
 
   writeVersion(version);
-  if (check() !== version) throw new Error("Version rewrite did not apply to every file");
+  if (check({ checkTag: false }) !== version) throw new Error("Version rewrite did not apply to every file");
 
   git(["add", ...Object.values(files)]);
   git(["commit", "-m", `Release ${tag}`], { stdio: "inherit" });
