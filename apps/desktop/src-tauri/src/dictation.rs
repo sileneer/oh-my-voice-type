@@ -221,8 +221,7 @@ pub fn start(app: &AppHandle, request: SessionRequest) -> ovt_core::Result<Sessi
         });
         platform::set_session_active(true);
     }
-    let area = platform::target_work_area();
-    pill_show(app, area);
+    pill_show(app);
     update_tray(app);
     Ok(SessionStarted {
         session_id,
@@ -798,13 +797,15 @@ fn notify_pending(app: &AppHandle) {
     update_tray(app);
 }
 
-fn pill_show(app: &AppHandle, area: Option<(i32, i32, i32, i32)>) {
+fn pill_show(app: &AppHandle) {
     let app = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
         let Some(pill) = app.get_webview_window("pill") else {
             return;
         };
-        if let Some((x, y, width, height)) = area {
+        // Measured here, on the main thread: AppKit's screen API returns
+        // nothing elsewhere, so hotkey starts left the pill unpositioned.
+        if let Some((x, y, width, height)) = platform::target_work_area() {
             let size = pill
                 .outer_size()
                 .unwrap_or(tauri::PhysicalSize::new(340, 64));
@@ -934,12 +935,16 @@ fn spawn_hotkey_worker(
     std::thread::Builder::new()
         .name("ovt-hotkey-actions".into())
         .spawn(move || {
-            // The session this key started, so its Stop/chord never ends a
-            // session that a different key or the UI started.
-            let mut owned: Option<String> = None;
             for event in rx {
                 match event {
                     HotkeyEvent::Start => {
+                        // Saving settings reinstalls the hooks with fresh,
+                        // idle decoders, so the press that should stop a
+                        // latched take arrives as Start. Treat it as Stop.
+                        if let Some(id) = take_owner_if_recording(mode) {
+                            request_stop_session(&id);
+                            continue;
+                        }
                         match start(
                             &app,
                             SessionRequest {
@@ -948,9 +953,9 @@ fn spawn_hotkey_worker(
                                 source: SessionSource::Hotkey,
                             },
                         ) {
-                            Ok(started) => owned = Some(started.session_id),
+                            Ok(started) => set_owner(mode, Some(started.session_id)),
                             Err(error) => {
-                                owned = None;
+                                set_owner(mode, None);
                                 let _ = app.emit(
                                     "session:error",
                                     serde_json::json!({ "message": error.to_string() }),
@@ -959,19 +964,19 @@ fn spawn_hotkey_worker(
                         }
                     }
                     HotkeyEvent::Stop => {
-                        if let Some(id) = owned.take() {
+                        if let Some(id) = take_owner(mode) {
                             request_stop_session(&id);
                         }
                     }
                     HotkeyEvent::Cancel => {
-                        owned = None;
+                        set_owner(mode, None);
                         cancel(&app);
                     }
                     // The activation key was part of a chord (e.g. Alt+Tab): the
                     // decoder dropped the take, so drop the session it started;
                     // otherwise it keeps recording with no key left to stop it.
                     HotkeyEvent::PassThrough => {
-                        if let Some(id) = owned.take() {
+                        if let Some(id) = take_owner(mode) {
                             cancel_recording_session(&app, &id);
                         }
                     }
@@ -982,6 +987,45 @@ fn spawn_hotkey_worker(
             ovt_core::Error::Unsupported(format!("cannot start hotkey worker: {error}"))
         })?;
     Ok(tx)
+}
+
+/// Which session each mode's hotkey started. Process-wide rather than per
+/// worker so it survives the hook reinstall that every settings save does;
+/// a worker-local copy was lost and the key could no longer stop its take.
+/// A key's Stop or chord must never end a session another key or the UI began.
+static HOTKEY_OWNERS: LazyLock<Mutex<Vec<(SessionMode, String)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn hotkey_owners() -> std::sync::MutexGuard<'static, Vec<(SessionMode, String)>> {
+    HOTKEY_OWNERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn set_owner(mode: SessionMode, session_id: Option<String>) {
+    let mut owners = hotkey_owners();
+    owners.retain(|(owner, _)| *owner != mode);
+    if let Some(id) = session_id {
+        owners.push((mode, id));
+    }
+}
+
+fn take_owner(mode: SessionMode) -> Option<String> {
+    let mut owners = hotkey_owners();
+    let index = owners.iter().position(|(owner, _)| *owner == mode)?;
+    Some(owners.remove(index).1)
+}
+
+/// The mode's own session if it is still starting or recording.
+fn take_owner_if_recording(mode: SessionMode) -> Option<String> {
+    let id = hotkey_owners()
+        .iter()
+        .find(|(owner, _)| *owner == mode)
+        .map(|(_, id)| id.clone())?;
+    let recording = lock_active()
+        .as_ref()
+        .is_some_and(|session| session.meta.id == id && session.phase != Phase::Processing);
+    recording.then(|| take_owner(mode)).flatten()
 }
 
 fn request_stop_session(session_id: &str) {
@@ -1320,6 +1364,22 @@ fn update_tray(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hotkey_ownership_is_per_mode_and_ignores_finished_sessions() {
+        set_owner(SessionMode::Translate, Some("t-1".into()));
+        set_owner(SessionMode::EditSelection, Some("e-1".into()));
+        // Re-owning replaces, never duplicates.
+        set_owner(SessionMode::Translate, Some("t-2".into()));
+        assert_eq!(take_owner(SessionMode::Translate).as_deref(), Some("t-2"));
+        assert_eq!(take_owner(SessionMode::Translate), None);
+        // No active session: a fresh Start must start, not stop.
+        assert_eq!(take_owner_if_recording(SessionMode::EditSelection), None);
+        assert_eq!(
+            take_owner(SessionMode::EditSelection).as_deref(),
+            Some("e-1")
+        );
+    }
 
     #[test]
     fn build_asr_passes_model_and_base_url_to_u2() {

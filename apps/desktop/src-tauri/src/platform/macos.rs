@@ -39,14 +39,21 @@ pub fn foreground_work_area() -> Option<(i32, i32, i32, i32)> {
     use objc2_app_kit::NSScreen;
     use objc2_foundation::MainThreadMarker;
 
+    // Main-thread only: callers run this inside `run_on_main_thread`.
     let mtm = MainThreadMarker::new()?;
     let screen = NSScreen::mainScreen(mtm)?;
-    let frame = screen.visibleFrame();
+    let full = screen.frame();
+    let visible = screen.visibleFrame();
+    // AppKit reports points with the origin at the bottom-left; Tauri's
+    // `set_position` takes physical pixels from the top-left. Without this the
+    // pill landed over the Dock (and at half the offset on Retina screens).
+    let scale = screen.backingScaleFactor();
+    let top = full.size.height - (visible.origin.y + visible.size.height);
     Some((
-        frame.origin.x as i32,
-        frame.origin.y as i32,
-        frame.size.width as i32,
-        frame.size.height as i32,
+        (visible.origin.x * scale) as i32,
+        (top * scale) as i32,
+        (visible.size.width * scale) as i32,
+        (visible.size.height * scale) as i32,
     ))
 }
 
@@ -110,15 +117,13 @@ impl TextInserter for MacInserter {
         clipboard_set_text(text)?;
         std::thread::sleep(Duration::from_millis(20));
         simulate_cmd_v()?;
-        if previous.is_some() {
-            let prev = previous;
+        if let Some(previous) = previous {
             let inserted = text.to_string();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(700));
+                // 700 ms let slow targets paste the restored old content.
+                std::thread::sleep(Duration::from_millis(1500));
                 if clipboard_get_text().as_deref() == Some(inserted.as_str()) {
-                    if let Some(prev) = prev {
-                        let _ = clipboard_set_text(&prev);
-                    }
+                    let _ = clipboard_set_text(&previous);
                 }
             });
         }

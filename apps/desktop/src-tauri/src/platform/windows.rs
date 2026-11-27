@@ -82,21 +82,70 @@ impl TextInserter for WindowsInserter {
     }
 }
 
+/// How long the dictated text stays on the clipboard after Ctrl+V. Targets read
+/// the clipboard asynchronously; 700 ms was short enough that a busy app (large
+/// Electron/Office windows) could paste the restored old content instead.
+const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(1500);
+
+enum ClipboardSnapshot {
+    Text(String),
+    Image(arboard::ImageData<'static>),
+    Empty,
+}
+
+fn clipboard_snapshot() -> ClipboardSnapshot {
+    let Ok(mut clipboard) = arboard::Clipboard::new() else {
+        return ClipboardSnapshot::Empty;
+    };
+    if let Ok(text) = clipboard.get_text() {
+        return ClipboardSnapshot::Text(text);
+    }
+    // Only text was saved before, so a copied screenshot was silently replaced
+    // by the dictation.
+    match clipboard.get_image() {
+        Ok(image) => ClipboardSnapshot::Image(image.to_owned_img()),
+        Err(_) => ClipboardSnapshot::Empty,
+    }
+}
+
+fn clipboard_restore(snapshot: ClipboardSnapshot) {
+    let Ok(mut clipboard) = arboard::Clipboard::new() else {
+        return;
+    };
+    let _ = match snapshot {
+        ClipboardSnapshot::Text(text) => clipboard.set_text(text),
+        ClipboardSnapshot::Image(image) => clipboard.set_image(image),
+        ClipboardSnapshot::Empty => clipboard.clear(),
+    };
+}
+
 fn paste_with_restore(text: &str) -> Result<()> {
-    let previous = clipboard_get_text();
-    clipboard_set_text(text)?;
+    let previous = clipboard_snapshot();
+    clipboard_set_transient_text(text)?;
     std::thread::sleep(Duration::from_millis(30));
     send_paste_keystrokes()?;
     let inserted = text.to_string();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(700));
+        std::thread::sleep(CLIPBOARD_RESTORE_DELAY);
+        // Leave the clipboard alone if the user copied something meanwhile.
         if clipboard_get_text().as_deref() == Some(inserted.as_str()) {
-            if let Some(previous) = previous {
-                let _ = clipboard_set_text(&previous);
-            }
+            clipboard_restore(previous);
         }
     });
     Ok(())
+}
+
+/// The paste-only copy is kept out of Win+V history and cloud clipboard sync:
+/// it is restored a moment later and dictated text should not linger there.
+fn clipboard_set_transient_text(text: &str) -> Result<()> {
+    use arboard::SetExtWindows;
+    let mut cb = arboard::Clipboard::new()
+        .map_err(|e| ovt_core::Error::Insert(format!("clipboard unavailable: {e}")))?;
+    cb.set()
+        .exclude_from_history()
+        .exclude_from_cloud()
+        .text(text.to_string())
+        .map_err(|e| ovt_core::Error::Insert(format!("clipboard write failed: {e}")))
 }
 
 fn clipboard_set_text(text: &str) -> Result<()> {
