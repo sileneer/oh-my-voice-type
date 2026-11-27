@@ -257,26 +257,51 @@ fn foreground_exe() -> String {
     }
 }
 
-/// Refuse politely when the target app runs elevated: SendInput from a
-/// non-elevated process cannot reach UIPI-elevated windows.
+/// Refuse when the target app runs elevated and this app does not: UIPI drops
+/// SendInput into higher-integrity windows *silently*, so the session reported
+/// "inserted" while nothing was typed. Returning an error makes the host copy
+/// the text and say so. The old check (can we open the process?) always
+/// passed, because limited-query access is granted to elevated processes too.
 fn ensure_not_elevated() -> Result<()> {
+    let Some(pid) = foreground_pid(unsafe { GetForegroundWindow() }) else {
+        return Ok(());
+    };
+    let own = process_elevated(unsafe { GetCurrentProcessId() }).unwrap_or(false);
+    if !own && process_elevated(pid) == Some(true) {
+        return Err(ovt_core::Error::Insert(
+            "the focused app runs as administrator, which blocks typed input from this app — the text was copied to the clipboard instead"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a process runs with an elevated (administrator) token; `None` when
+/// the token cannot be read, which is treated as "not known to be elevated".
+fn process_elevated(pid: u32) -> Option<bool> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::OpenProcessToken;
     unsafe {
-        let hwnd = GetForegroundWindow();
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == 0 {
-            return Ok(());
-        }
-        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-            Ok(h) => {
-                let _ = CloseHandle(h);
-                Ok(())
-            }
-            Err(_) => Err(ovt_core::Error::Insert(
-                "the focused app runs elevated (as administrator); run this app elevated too, or the text is copied to the clipboard instead"
-                    .into(),
-            )),
-        }
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut token = HANDLE::default();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token);
+        let _ = CloseHandle(process);
+        opened.ok()?;
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0u32;
+        let queried = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut TOKEN_ELEVATION as *mut std::ffi::c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        let _ = CloseHandle(token);
+        queried.ok()?;
+        Some(elevation.TokenIsElevated != 0)
     }
 }
 
@@ -852,6 +877,15 @@ mod tests {
         assert!(!is_ignored_hook_event(&event(0xA2, 0x1D, 0)));
         assert!(!is_ignored_hook_event(&event(0x41, 0x1E, 0)));
         assert!(is_alt_vk(0xA5) && is_alt_vk(0xA4) && !is_alt_vk(0xA3));
+    }
+
+    #[test]
+    fn reads_this_process_elevation() {
+        // The test runner can always read its own token; a non-admin shell is
+        // not elevated. (Asserting only that it is readable keeps the test
+        // valid when CI happens to run elevated.)
+        assert!(process_elevated(unsafe { GetCurrentProcessId() }).is_some());
+        assert_eq!(process_elevated(0), None);
     }
 
     #[test]
