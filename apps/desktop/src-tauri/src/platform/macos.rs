@@ -15,9 +15,9 @@ use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use core_foundation::base::{CFRelease, CFStringRef, CFTypeRef, TCFType};
+use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
-use core_foundation::string::CFString;
+use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::event::{
     CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventType, EventField,
