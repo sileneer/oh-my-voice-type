@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, Languages, LoaderCircle, Mic, PencilLine, Square, TriangleAlert, X } from "lucide-react";
 import { isTauri } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, events, type Mode } from "./lib/api";
 import { useTheme } from "./lib/theme";
 import { makeT, resolveLocale } from "./i18n";
@@ -71,7 +70,9 @@ export default function Pill() {
 
   useEffect(() => {
     if (phase.kind !== "done" && phase.kind !== "error") return;
-    const timer = window.setTimeout(() => { if (isTauri()) void getCurrentWindow().hide(); }, 1500);
+    // Hide through the backend: on Windows the pill is shown with a raw Win32
+    // call, so `getCurrentWindow().hide()` silently does nothing.
+    const timer = window.setTimeout(() => { if (isTauri()) void api.pillHide().catch(() => undefined); }, 1500);
     return () => window.clearTimeout(timer);
   }, [phase.kind]);
 
@@ -94,7 +95,9 @@ export default function Pill() {
 
   return (
     <div className="flex h-full w-full items-center justify-center" role="status" aria-live="polite">
-      <div className={cn("flex h-14 w-[328px] items-center gap-3 rounded-full border bg-card/95 px-4 shadow-xl backdrop-blur", phase.kind === "error" ? "border-destructive/30" : "border-border")}>
+      {/* Fill the transparent window exactly: an outer shadow (or margin) gets
+          clipped at the window edge and shows up as a faint rectangle. */}
+      <div className={cn("flex h-full w-full items-center gap-3 rounded-full border bg-card px-4", phase.kind === "error" ? "border-destructive/40" : "border-border")}>
         <div className={cn("flex size-8 shrink-0 items-center justify-center rounded-full", phase.kind === "recording" ? "bg-destructive/10 text-destructive" : phase.kind === "error" ? "bg-destructive/10 text-destructive" : "bg-primary/10 text-primary")}>
           <StatusIcon className={cn("size-4", active && phase.kind !== "recording" && "animate-spin motion-reduce:animate-none")} aria-hidden="true" />
         </div>
@@ -104,7 +107,7 @@ export default function Pill() {
         </div>
         {phase.kind === "recording" && <Waveform level={phase.level} />}
         {active && <button type="button" onClick={() => void api.cancel()} aria-label={t("pill.cancel")} className="flex size-8 shrink-0 items-center justify-center rounded-full text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"><Square className="size-3.5" aria-hidden="true" /></button>}
-        {phase.kind === "error" && <button type="button" onClick={() => void getCurrentWindow().hide()} aria-label={t("common.close")} className="flex size-8 shrink-0 items-center justify-center rounded-full text-muted-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"><X className="size-4" aria-hidden="true" /></button>}
+        {phase.kind === "error" && <button type="button" onClick={() => void api.pillHide().catch(() => undefined)} aria-label={t("common.close")} className="flex size-8 shrink-0 items-center justify-center rounded-full text-muted-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"><X className="size-4" aria-hidden="true" /></button>}
       </div>
     </div>
   );

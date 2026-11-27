@@ -232,6 +232,7 @@ export const api = {
   permissionStatus: () => invoke<Record<string, string>>("permission_status"),
   toggle: () => invoke<void>("dictation_toggle"),
   cancel: () => invoke<void>("dictation_cancel"),
+  pillHide: () => invoke<void>("pill_hide"),
   sessionStart: (request: SessionRequest) => invoke<{ session_id: string }>("session_start", { request }),
   historyList: (query: HistoryQuery) =>
     invoke<HistoryPage>("history_list", { ...query }),

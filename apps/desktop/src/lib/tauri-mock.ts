@@ -70,6 +70,10 @@ export function installTauriMock() {
     state.active_llm_profile_id = null;
   }
   const activeHistory = emptyMock ? [] : history;
+  const pending = emptyMock ? [] : [
+    { id: "pending-1", created_at_ms: now - 900_000, mode: "translate", target_language: "English", stage: "interrupted", attempts: 0, raw_text: "请把这段文字翻译成英文。", final_text: "", error: "Interrupted by restart", has_audio: true, delivery_uncertain: false },
+    { id: "pending-2", created_at_ms: now - 1_800_000, mode: "dictate", target_language: null, stage: "needs_review", attempts: 1, raw_text: "Check the deployment status.", final_text: "Check the deployment status.", error: null, has_audio: false, delivery_uncertain: true },
+  ];
   const readinessFor = (role: "asr" | "llm") => {
     const activeId = role === "asr" ? state.active_asr_profile_id : state.active_llm_profile_id;
     const list = role === "asr" ? state.asr_profiles : state.llm_profiles;
@@ -123,14 +127,22 @@ export function installTauriMock() {
       }
       case "history_export_audio": return false;
       case "copy_text": return undefined;
-      case "pending_list": return emptyMock ? [] : [
-        { id: "pending-1", created_at_ms: now - 900_000, mode: "translate", target_language: "English", stage: "interrupted", attempts: 0, raw_text: "请把这段文字翻译成英文。", final_text: "", error: "Interrupted by restart", has_audio: true, delivery_uncertain: false },
-        { id: "pending-2", created_at_ms: now - 1_800_000, mode: "dictate", target_language: null, stage: "needs_review", attempts: 1, raw_text: "Check the deployment status.", final_text: "Check the deployment status.", error: null, has_audio: false, delivery_uncertain: true },
-      ];
+      case "pending_list": return structuredClone(pending);
       case "pending_retry":
-      case "pending_copy":
-      case "pending_discard":
-      case "pending_cleanup": return command === "pending_cleanup" ? { deleted_count: 2, freed_bytes: 1024 } : undefined;
+      case "pending_copy": return undefined;
+      // Like the backend, deletes emit `pending:changed` so every count updates.
+      case "pending_discard": {
+        const index = pending.findIndex((task) => task.id === args.id);
+        if (index >= 0) pending.splice(index, 1);
+        void emit("pending:changed", { count: pending.length });
+        return undefined;
+      }
+      case "pending_cleanup": {
+        const deleted = pending.splice(0).length;
+        void emit("pending:changed", { count: 0 });
+        return { deleted_count: deleted, freed_bytes: deleted * 512 };
+      }
+      case "pill_hide": return undefined;
       case "dictionary_list": return [{ term: "Qoder" }, { term: "WebView2" }, { term: "standby power" }];
       case "dictionary_add": return [{ term: String(args.term) }];
       case "dictionary_rename": return [{ term: String(args.new_term) }];

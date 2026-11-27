@@ -63,6 +63,7 @@ pub fn run() {
             commands::session_start,
             commands::session_cancel,
             commands::dictation_cancel,
+            commands::pill_hide,
             commands::history_list,
             commands::history_delete,
             commands::history_delete_all,

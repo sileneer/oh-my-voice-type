@@ -7,7 +7,9 @@ Project rules that add to the user-level `AGENTS.md`. See `README.md` and `docs/
 - `cargo fmt --all --check`, `cargo clippy -p ovt-core -p ovt-desktop`, `cargo test -p ovt-core -p ovt-desktop`
 - `cd apps/desktop && npm test && npm run build` (vitest, then `tsc --noEmit` + vite)
 - `node --test scripts/release.test.mjs` (a directory argument such as `node --test scripts/` fails on Windows)
-- Browser preview of the UI: `http://localhost:5173/?mock=1` uses the IPC mock in `src/lib/tauri-mock.ts`; add `&update=1` to simulate an available update and `&locale=zh-CN` for Chinese.
+- Browser preview of the UI: `http://localhost:5173/?mock=1` uses the IPC mock in `src/lib/tauri-mock.ts`; add `&update=1` to simulate an available update, `&locale=zh-CN` for Chinese, and `&view=pill` for the recording pill (size the viewport to 340x64). Run Vite with `cwd` `apps/desktop` (`.claude/launch.json`: `"runtimeArgs": ["node_modules/vite/bin/vite.js"], "cwd": "apps/desktop"`); started from the repo root, Tailwind cannot find its config and every page shows a `bg-background` PostCSS error.
+- The pill window is shown with raw Win32 `ShowWindow(SW_SHOWNOACTIVATE)` (`platform::show_inactive`), so tao's cached visibility never changes and Tauri `hide()` is a no-op on Windows. Hide it only via `platform::hide_window` / the `pill_hide` command.
+- Commands that change the pending queue must emit `pending:changed` (and update the tray); the sidebar badge, home banner and settings count only refresh on that event.
 
 ## Providers
 

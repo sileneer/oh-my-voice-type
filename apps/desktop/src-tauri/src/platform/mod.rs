@@ -238,7 +238,31 @@ pub fn target_work_area() -> Option<(i32, i32, i32, i32)> {
 #[cfg(target_os = "windows")]
 use ::windows::Win32::Foundation::HWND;
 #[cfg(target_os = "windows")]
-use ::windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+use ::windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE};
+
+/// Hide a window shown with [`show_inactive`]; must run on the main thread.
+///
+/// On Windows `show_inactive` bypasses tao, whose cached visibility flag stays
+/// "hidden"; tao's `hide()` then sees no change and does nothing, which left
+/// the pill on screen forever. Hide it with the same Win32 call instead.
+pub fn hide_window(window: &tauri::WebviewWindow) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let tauri_hwnd = window.hwnd().map_err(|error| {
+            ovt_core::Error::Unsupported(format!("window handle unavailable: {error}"))
+        })?;
+        unsafe {
+            let _ = ShowWindow(HWND(tauri_hwnd.0), SW_HIDE);
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        window
+            .hide()
+            .map_err(|error| ovt_core::Error::Unsupported(format!("hide window: {error}")))
+    }
+}
 
 /// Show without activating; must run on the platform main thread.
 pub fn show_inactive(window: &tauri::WebviewWindow) -> Result<()> {

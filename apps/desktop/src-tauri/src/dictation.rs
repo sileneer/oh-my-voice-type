@@ -768,11 +768,11 @@ fn pill_show(app: &AppHandle, area: Option<(i32, i32, i32, i32)>) {
     });
 }
 
-fn pill_hide(app: &AppHandle) {
+pub fn pill_hide(app: &AppHandle) {
     let app = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
         if let Some(pill) = app.get_webview_window("pill") {
-            let _ = pill.hide();
+            let _ = platform::hide_window(&pill);
         }
     });
 }

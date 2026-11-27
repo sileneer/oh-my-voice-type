@@ -5,7 +5,7 @@ import {
 } from "lucide-react";
 import packageJson from "../../package.json";
 import {
-  api, type ApiStatus, type DictionaryEntry, type Mode, type Settings,
+  api, events, type ApiStatus, type DictionaryEntry, type Mode, type Settings,
 } from "../lib/api";
 import { toast } from "sonner";
 import { localeOptions, localizeHotkey, translationTargets, type Locale, type TFunc } from "../i18n";
@@ -227,6 +227,14 @@ function PrivacySettings({ settings, t, onSave, onError }: Pick<Props, "settings
   const dirty = changed({ history, context }, { history: settings.history, context: settings.context });
   const loadPending = useCallback(async () => { try { setPendingCount((await api.pendingList()).length); } catch { setPendingCount(0); } }, []);
   useEffect(() => { void loadPending(); }, [loadPending]);
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void events.onPendingChanged(() => { if (active) void loadPending(); }).then((fn) => {
+      if (active) unlisten = fn; else fn();
+    });
+    return () => { active = false; unlisten?.(); };
+  }, [loadPending]);
   const save = async () => { setSaving(true); try { await onSave({ ...settings, history, context }); } catch (cause) { onError(String(cause)); } finally { setSaving(false); } };
   const cleanup = async () => { try { await api.pendingCleanup(); setConfirmCleanup(false); await loadPending(); } catch (cause) { onError(String(cause)); } };
   const retention = history.retention_days === null ? "forever" : history.retention_days === 0 ? "never" : String(history.retention_days);

@@ -106,6 +106,25 @@ pub fn dictation_cancel(app: AppHandle) {
     dictation::cancel(&app);
 }
 
+/// The pill's own auto-hide and close button. `getCurrentWindow().hide()` is a
+/// no-op on Windows for a window shown via `show_inactive`.
+#[tauri::command]
+pub fn pill_hide(app: AppHandle) {
+    dictation::pill_hide(&app);
+}
+
+/// Tell every window (sidebar badge, home banner, settings count) and the tray
+/// that the pending queue changed; deletes made from the UI never did.
+fn notify_pending_changed(app: &AppHandle, state: &AppState) {
+    let count = state
+        .pending
+        .as_ref()
+        .and_then(|pending| pending.list().ok())
+        .map_or(0, |tasks| tasks.len());
+    let _ = app.emit("pending:changed", serde_json::json!({ "count": count }));
+    crate::tray::update(app);
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn history_list(
@@ -406,14 +425,20 @@ pub fn pending_copy(state: State<'_, AppState>, id: String) -> Result<(), String
 }
 
 #[tauri::command]
-pub fn pending_discard(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let task = state
+pub fn pending_discard(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let deleted = state
         .pending
         .as_ref()
         .ok_or("pending queue disabled")?
         .delete(&id)
-        .map_err(|e| e.to_string())?
-        .ok_or("pending task not found")?;
+        .map_err(|e| e.to_string());
+    // Refresh even when the row was already gone, so a stale count clears.
+    notify_pending_changed(&app, &state);
+    let task = deleted?.ok_or("pending task not found")?;
     if let Ok(path) = crate::pending::resolve_audio_path(&app_data_dir(), &task.audio_path) {
         let _ = std::fs::remove_file(path);
     }
@@ -421,7 +446,16 @@ pub fn pending_discard(state: State<'_, AppState>, id: String) -> Result<(), Str
 }
 
 #[tauri::command]
-pub fn pending_cleanup(state: State<'_, AppState>) -> Result<PendingCleanupResult, String> {
+pub fn pending_cleanup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<PendingCleanupResult, String> {
+    let result = pending_cleanup_inner(&state);
+    notify_pending_changed(&app, &state);
+    result
+}
+
+fn pending_cleanup_inner(state: &AppState) -> Result<PendingCleanupResult, String> {
     let pending = state.pending.as_ref().ok_or("pending queue disabled")?;
     let tasks = pending.list().map_err(|e| e.to_string())?;
     let deleted_count = tasks.len();
