@@ -12,7 +12,7 @@ use ovt_core::hotkey::{Edge, GestureDecoder};
 use ovt_core::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
@@ -349,11 +349,10 @@ impl HotkeyListener for MacHotkey {
         // The tap and its CFRunLoop must live on the same dedicated thread so
         // the tap stays alive for the duration of the run loop.
         std::thread::spawn(move || {
-            let decoder = Arc::new(Mutex::new((
+            let decoder = Mutex::new((
                 GestureDecoder::new(Duration::from_millis(350), smart),
                 false,
-            )));
-            let cb = Arc::new(callback);
+            ));
 
             let tap = match CGEventTap::new(
                 CGEventTapLocation::HID,
@@ -374,7 +373,7 @@ impl HotkeyListener for MacHotkey {
                     {
                         d.reset();
                         *was_down = false;
-                        cb(ovt_core::hotkey::HotkeyEvent::Cancel);
+                        callback(ovt_core::hotkey::HotkeyEvent::Cancel);
                         return None;
                     }
                     match kind {
@@ -388,7 +387,7 @@ impl HotkeyListener for MacHotkey {
                             *was_down = down;
                             if let Some(edge) = edge {
                                 if let Some(ev) = d.on_edge(edge, std::time::Instant::now()) {
-                                    cb(ev);
+                                    callback(ev);
                                 }
                             }
                         }
@@ -396,7 +395,7 @@ impl HotkeyListener for MacHotkey {
                             if flags.contains(mask) {
                                 // other key pressed while activation modifier held
                                 if let Some(ev) = d.note_other_key() {
-                                    cb(ev);
+                                    callback(ev);
                                 }
                             }
                         }

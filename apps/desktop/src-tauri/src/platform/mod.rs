@@ -135,7 +135,7 @@ pub fn context_provider() -> Box<dyn ContextProvider> {
     }
     #[cfg(target_os = "macos")]
     {
-        Box::new(macos::MacContext::default())
+        Box::new(macos::MacContext)
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
@@ -156,7 +156,7 @@ pub fn hotkey_listener() -> Box<dyn HotkeyListener> {
     }
     #[cfg(target_os = "macos")]
     {
-        Box::new(macos::MacHotkey::default())
+        Box::new(macos::MacHotkey)
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
