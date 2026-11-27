@@ -196,7 +196,17 @@ function PersonalizationSettings({ settings, t, onSave, onError }: Pick<Props, "
   const dirty = changed(dictation, settings.dictation);
   const loadDictionary = useCallback(async () => { try { setEntries(await api.dictionaryList()); } catch (cause) { onError(String(cause)); } }, [onError]);
   useEffect(() => { void loadDictionary(); }, [loadDictionary]);
-  const save = async () => { setSaving(true); try { await onSave({ ...settings, dictation }); } catch (cause) { onError(String(cause)); } finally { setSaving(false); } };
+  // "Add" inserts an empty rule, and the backend rejects a rule without an app,
+  // so a blank row made every save of this page fail. Drop fully blank rows;
+  // a style without an app is flagged instead of silently discarded.
+  const toneMissingApp = dictation.app_tones.some((tone) => tone.app.trim() === "" && tone.style.trim() !== "");
+  const save = async () => {
+    if (toneMissingApp) return;
+    setSaving(true);
+    try {
+      await onSave({ ...settings, dictation: { ...dictation, app_tones: dictation.app_tones.filter((tone) => tone.app.trim() !== "") } });
+    } catch (cause) { onError(String(cause)); } finally { setSaving(false); }
+  };
   const add = async () => { if (!term.trim()) return; try { setEntries(await api.dictionaryAdd(term.trim())); setTerm(""); } catch (cause) { onError(String(cause)); } };
   const rename = async () => { if (!renameEntry || !renameValue.trim()) return; try { setEntries(await api.dictionaryRename(renameEntry.term, renameValue.trim())); setRenameEntry(null); } catch (cause) { onError(String(cause)); } };
   const remove = async (entry: DictionaryEntry) => { try { setEntries(await api.dictionaryRemove(entry.term)); } catch (cause) { onError(String(cause)); } };
@@ -204,11 +214,12 @@ function PersonalizationSettings({ settings, t, onSave, onError }: Pick<Props, "
   const updateTone = (index: number, patch: Partial<(typeof dictation.app_tones)[number]>) => setDictation({ ...dictation, app_tones: dictation.app_tones.map((tone, i) => i === index ? { ...tone, ...patch } : tone) });
   return (
     <div className="space-y-5">
-      <Section title={t("settings.tone")} footer={<SaveBar saving={saving} dirty={dirty} t={t} onClick={() => void save()} />}>
+      <Section title={t("settings.tone")} footer={<SaveBar saving={saving} dirty={dirty && !toneMissingApp} t={t} onClick={() => void save()} />}>
         <Field label={t("settings.defaultTone")}><Input value={dictation.default_tone ?? ""} onChange={(event) => setDictation({ ...dictation, default_tone: event.target.value })} placeholder={t("settings.stylePlaceholder")} /></Field>
         <div className="space-y-3">
           <div className="flex items-center justify-between gap-3"><h3 className="text-sm font-medium">{t("settings.appTone")}</h3><Button type="button" variant="outline" size="sm" onClick={addTone}><Plus className="size-4" aria-hidden="true" />{t("common.add")}</Button></div>
-          {dictation.app_tones.map((tone, index) => <div key={index} className="flex flex-wrap items-end gap-2"><Field label={t("settings.appTonePlaceholder")}><Input value={tone.app} onChange={(event) => updateTone(index, { app: event.target.value })} /></Field><Field label={t("settings.stylePlaceholder")}><Input value={tone.style} onChange={(event) => updateTone(index, { style: event.target.value })} /></Field><Button type="button" variant="ghost" size="icon" aria-label={t("common.delete")} onClick={() => setDictation({ ...dictation, app_tones: dictation.app_tones.filter((_, i) => i !== index) })}><X className="size-4" /></Button></div>)}
+          {toneMissingApp && <p className="text-xs text-destructive" role="alert">{t("settings.appToneMissingApp")}</p>}
+          {dictation.app_tones.map((tone, index) => <div key={index} className="flex flex-wrap items-end gap-2"><Field label={t("settings.appTonePlaceholder")}><Input value={tone.app} aria-invalid={tone.app.trim() === "" && tone.style.trim() !== "" ? true : undefined} onChange={(event) => updateTone(index, { app: event.target.value })} /></Field><Field label={t("settings.stylePlaceholder")}><Input value={tone.style} onChange={(event) => updateTone(index, { style: event.target.value })} /></Field><Button type="button" variant="ghost" size="icon" aria-label={t("common.delete")} onClick={() => setDictation({ ...dictation, app_tones: dictation.app_tones.filter((_, i) => i !== index) })}><X className="size-4" /></Button></div>)}
         </div>
       </Section>
       <Section title={t("settings.dictionary")} description={t("settings.dictionaryHint")}>

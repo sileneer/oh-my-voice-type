@@ -209,6 +209,9 @@ fn spawn_start(app: &AppHandle, mode: SessionMode) {
 
 fn show_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        // Starting from the main window minimizes it (focus goes back to the
+        // target app); show() alone leaves a minimized window minimized.
+        let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }

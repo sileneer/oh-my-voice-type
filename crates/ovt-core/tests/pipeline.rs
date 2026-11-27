@@ -332,6 +332,82 @@ async fn cleanup_failure_falls_back_to_raw() {
 }
 
 #[tokio::test]
+async fn reasoning_blocks_are_never_inserted() {
+    let asr = mock_asr("hello world");
+    let llm = Arc::new(MockLlm {
+        reply: Ok(
+            "<think>The user wants punctuation.\nAdd a comma.</think>\n\nHello, world.".into(),
+        ),
+        calls: AtomicUsize::new(0),
+        cleanup: Mutex::new(None),
+    });
+    let e = engine(asr, llm, None);
+    let typed = Mutex::new(String::new());
+    let outcome = e
+        .process(DictationInput::new(speech_wav(), Mode::Dictate), |text| {
+            *typed.lock().unwrap() = text.to_string();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_text, "Hello, world.");
+    assert_eq!(*typed.lock().unwrap(), "Hello, world.");
+
+    // Cut off inside the reasoning: dictation falls back to the transcript.
+    assert_eq!(
+        ovt_core::dictation::strip_reasoning("<THINK>still going"),
+        ""
+    );
+    assert_eq!(
+        ovt_core::dictation::strip_reasoning("  plain answer "),
+        "plain answer"
+    );
+}
+
+#[tokio::test]
+async fn empty_transcript_never_inserts_or_records_history() {
+    // The desktop host relies on this: an empty outcome must not reach the
+    // inserter or history, so it can discard the take without a clipboard copy.
+    let asr = mock_asr("   ");
+    let llm = Arc::new(MockLlm {
+        reply: Ok("unused".into()),
+        calls: AtomicUsize::new(0),
+        cleanup: Mutex::new(None),
+    });
+    let history = Arc::new(HistoryRepo::open_in_memory().unwrap());
+    let e = engine(asr, llm, Some(history.clone()));
+    let mut inserted = false;
+    let outcome = e
+        .process(DictationInput::new(speech_wav(), Mode::Dictate), |_| {
+            inserted = true;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(!inserted);
+    assert!(outcome.final_text.is_empty());
+    assert!(outcome.warnings[0].contains("Nothing heard"));
+    assert_eq!(history.count().unwrap(), 0);
+}
+
+#[test]
+fn recovered_native_rate_audio_is_normalised_to_16k() {
+    // Pending recordings are stored at the microphone's rate; recovery must
+    // send the provider the same 16 kHz payload as a live session.
+    let samples: Vec<f32> = (0..48_000)
+        .map(|i| ((i as f32) * 0.01).sin() * 0.3)
+        .collect();
+    let stored = wav::encode_wav_mono(&samples, 48_000);
+    let (decoded, rate) = wav::decode_pcm16_wav(&stored).unwrap();
+    assert_eq!(rate, 48_000);
+    let (payload, peak) = ovt_core::dictation::prepare_audio(&decoded, rate);
+    let payload_rate = u32::from_le_bytes(payload[24..28].try_into().unwrap());
+    assert_eq!(payload_rate, TARGET_SAMPLE_RATE);
+    assert!(peak > -20.0);
+    ovt_core::dictation::ensure_has_audio(peak).unwrap();
+}
+
+#[tokio::test]
 async fn insert_failure_reports_not_inserted() {
     let asr = mock_asr("hi");
     let llm = Arc::new(MockLlm {

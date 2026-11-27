@@ -301,6 +301,7 @@ impl DictationEngine {
                     })
                     .await;
                 cleanup_ms = Some(cleanup_start.elapsed().as_millis() as u64);
+                let result = result.map(|text| strip_reasoning(&text));
                 match result {
                     Ok(text) if !text.trim().is_empty() && text.trim() != EMPTY_SENTINEL => {
                         text.trim().to_string()
@@ -417,6 +418,26 @@ impl DictationEngine {
             target_language: input.target_language.clone(),
             preserve_wording: self.settings.dictation.preserve_wording,
             no_list_formatting: self.settings.dictation.no_list_formatting,
+        }
+    }
+}
+
+/// Remove inline chain-of-thought that reasoning models served through
+/// OpenAI-compatible gateways prepend to the answer (`<think>…</think>`), so it
+/// is never typed into the user's document. An unterminated block means the
+/// answer was cut off inside the reasoning: nothing usable remains.
+pub fn strip_reasoning(text: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let mut rest = text.trim_start();
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        if !lower.starts_with(OPEN) {
+            return rest.trim().to_string();
+        }
+        match lower.find(CLOSE) {
+            Some(end) => rest = rest[end + CLOSE.len()..].trim_start(),
+            None => return String::new(),
         }
     }
 }

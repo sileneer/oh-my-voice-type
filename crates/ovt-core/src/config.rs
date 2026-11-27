@@ -173,9 +173,14 @@ pub struct AppTone {
 impl DictationSettings {
     pub fn tone_for_app(&self, app_name: Option<&str>) -> Option<String> {
         let app_lc = app_name.unwrap_or("").to_lowercase();
+        // Trim the rule's app name (" Slack" never matched) and skip rules
+        // without a style so they fall through to the default tone.
         self.app_tones
             .iter()
-            .find(|tone| !tone.app.trim().is_empty() && app_lc.contains(&tone.app.to_lowercase()))
+            .find(|tone| {
+                let app = tone.app.trim().to_lowercase();
+                !app.is_empty() && !tone.style.trim().is_empty() && app_lc.contains(&app)
+            })
             .map(|tone| tone.style.as_str())
             .or_else(|| {
                 (!self.default_tone.trim().is_empty()).then_some(self.default_tone.as_str())
@@ -1167,6 +1172,25 @@ mod tests {
         assert_eq!(
             settings.dictation.tone_for_app(Some("Slack")),
             Some("friendly".into())
+        );
+        // Padded app names still match; empty styles fall through to default.
+        settings.dictation.app_tones = vec![
+            AppTone {
+                app: " Code ".into(),
+                style: "technical".into(),
+            },
+            AppTone {
+                app: "notepad".into(),
+                style: "  ".into(),
+            },
+        ];
+        assert_eq!(
+            settings.dictation.tone_for_app(Some("Code")),
+            Some("technical".into())
+        );
+        assert_eq!(
+            settings.dictation.tone_for_app(Some("Notepad")),
+            Some("concise".into())
         );
     }
 

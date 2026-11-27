@@ -46,7 +46,9 @@ impl AnthropicLlm {
             "max_tokens": req.max_tokens,
             "system": req.system,
             "messages": [{"role": "user", "content": req.user}],
-            "temperature": req.temperature,
+            // Settings allow up to 2.0 (OpenAI's range); the Messages API
+            // rejects anything above 1.0 with HTTP 400.
+            "temperature": req.temperature.clamp(0.0, 1.0),
         })
     }
 }
