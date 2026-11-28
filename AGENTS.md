@@ -14,6 +14,8 @@ Project rules that add to the user-level `AGENTS.md`. See `README.md` and `docs/
 - Tray menu: build it once and update items in place (`set_text`/`set_enabled`); menus swapped in with `TrayIcon::set_menu` from worker threads never delivered clicks on Windows.
 - The Windows keyboard hook ignores only this app's own `SendInput` events (tagged `OVT_INJECTED_TAG` in `dwExtraInfo`); other injected keys (PowerToys/AutoHotkey remaps, On-Screen Keyboard) must still drive the hotkey.
 - Real-device testing: run `node node_modules/@tauri-apps/cli/tauri.js dev` from `apps/desktop` with `OVT_DATA_DIR` set to a scratch folder (debug builds only) so real history is untouched. Saving any Rust file restarts the app and kills an in-flight session. Desktop automation cannot press side-specific Right Alt, so bind F8 in the scratch settings; Windows popup menus need a hover before a synthetic click registers.
+- UIA `CompareEndpoints` only promises a sign (Chromium returns -1/0/1); measure a caret offset as the text length of a document-start-to-caret range instead. UIA `SetValue` on Win32 Edit is `WM_SETTEXT` and wipes the undo stack; use `EM_REPLACESEL` there.
+- macOS Fn/Globe in IOHIDManager is usage 0x03 on page 0xFF (MacBook top case) or 0xFF01 (Magic Keyboard). 0x3F is the virtual keycode `kVK_Function`; on HID keyboard page 0x07 it is F6.
 - Commands that change the pending queue must emit `pending:changed` (and update the tray); the sidebar badge, home banner and settings count only refresh on that event.
 
 ## Providers

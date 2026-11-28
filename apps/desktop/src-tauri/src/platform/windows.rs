@@ -1,6 +1,7 @@
 //! Windows integration:
-//! - `WindowsInserter`: clipboard write + synthesized paste (SendInput),
-//!   clipboard restore, elevated-target detection.
+//! - `WindowsInserter`: UI Automation value insertion at the caret (strategy
+//!   ladder level 1), falling back to clipboard write + synthesized paste
+//!   (SendInput) with clipboard restore and elevated-target detection.
 //! - `WindowsContext`: foreground window app name / title.
 //! - `WindowsHotkey`: low-level keyboard hook (`WH_KEYBOARD_LL`) feeding the
 //!   shared gesture decoder.
@@ -17,8 +18,10 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM};
+use windows::core::{BSTR, PWSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_TIMEOUT, HWND, LPARAM, LRESULT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
@@ -34,8 +37,9 @@ use windows::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationTextPattern, TextPatternRangeEndpoint_End,
-    TextPatternRangeEndpoint_Start, TextUnit_Character, UIA_TextPatternId,
+    CUIAutomation, IUIAutomation, IUIAutomationTextPattern, IUIAutomationValuePattern,
+    TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start, TextUnit_Character,
+    UIA_TextPatternId, UIA_ValuePatternId,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
@@ -43,10 +47,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
-    PostThreadMessageW, SetForegroundWindow, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    GetWindowLongW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
+    IsWindowVisible, PostThreadMessageW, SendMessageTimeoutW, SetForegroundWindow,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, GWL_STYLE, HC_ACTION,
+    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, SMTO_NORMAL, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
+    WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 pub use super::{ContextProvider, TargetInfo, TextInserter};
@@ -75,12 +80,327 @@ impl TextInserter for WindowsInserter {
             return Ok(());
         }
         ensure_not_elevated()?;
+        // Strategy ladder level 1: UI Automation value insertion, no clipboard.
+        // Level 2 (clipboard + paste) covers everything UIA cannot edit:
+        // terminals, rich editors, and every failure mode.
+        if uia_direct_insert(text) {
+            return Ok(());
+        }
         paste_with_restore(text)
     }
 
     fn copy(&self, text: &str) -> Result<()> {
         clipboard_set_text(text)
     }
+}
+
+/// Capped document size for the consistency check in [`try_uia_value_insert`];
+/// beyond this the read-modify-write cost outweighs the paste fallback.
+const DIRECT_INSERT_MAX_CHARS: usize = 20_000;
+
+/// Strategy ladder level 1: insert at the caret through UI Automation without
+/// touching the clipboard. Empty fields take the text as-is; other fields are
+/// spliced at the caret (replacing any selection), but only when the
+/// TextPattern view of the document matches the field value exactly, so
+/// line-ending or rich-text differences can never move the insertion point.
+/// `false` = the control does not accept direct edits; the caller falls back
+/// to the clipboard ladder.
+fn uia_direct_insert(text: &str) -> bool {
+    let automation = match automation() {
+        Ok(automation) => automation,
+        Err(_) => return false,
+    };
+    match unsafe { try_uia_value_insert(&automation, text) } {
+        Ok(true) => {
+            tracing::info!("inserted via UI Automation value set");
+            true
+        }
+        Ok(false) => {
+            tracing::info!("UIA direct insert unsupported; falling back to clipboard paste");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "UIA direct insert failed; falling back to clipboard paste");
+            false
+        }
+    }
+}
+
+unsafe fn try_uia_value_insert(automation: &IUIAutomation, text: &str) -> Result<bool> {
+    let element = automation
+        .GetFocusedElement()
+        .map_err(|error| accessibility_error("focused element", error))?;
+    let secure = element
+        .CurrentIsPassword()
+        .map(|value| value.as_bool())
+        .unwrap_or(false);
+    if secure {
+        // Refuse to set values in password fields; the clipboard path keeps
+        // the v1 behavior for them.
+        return Ok(false);
+    }
+    // Classic Win32 Edit / RichEdit controls take EM_REPLACESEL: a native
+    // caret insert that stays on the control's undo stack (a SetValue maps to
+    // WM_SETTEXT, which empties it).
+    let hwnd = element
+        .CurrentNativeWindowHandle()
+        .unwrap_or(HWND(std::ptr::null_mut()));
+    if let Some(inserted) = win32_edit_replace_selection(hwnd, text) {
+        return Ok(inserted);
+    }
+    let pattern = element
+        .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+        .map_err(|_| ovt_core::Error::Unsupported("no UI Automation value pattern".into()))?;
+    if pattern
+        .CurrentIsReadOnly()
+        .map(|value| value.as_bool())
+        .unwrap_or(true)
+    {
+        return Ok(false);
+    }
+    let current = pattern
+        .CurrentValue()
+        .map_err(|error| accessibility_error("field value", error))?
+        .to_string();
+    let text_pattern = element
+        .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+        .ok();
+    if current.is_empty() {
+        // An empty Value is only trusted when the document agrees: some rich
+        // controls report "" while showing text, and SetValue would wipe it.
+        if let Some(text_pattern) = text_pattern.as_ref() {
+            let document_text = text_pattern
+                .DocumentRange()
+                .and_then(|document| document.GetText(-1))
+                .map_err(|error| accessibility_error("document text", error))?;
+            if !document_text.is_empty() {
+                return Ok(false);
+            }
+        }
+    }
+    let (new_value, restore) = if current.is_empty() {
+        (
+            text.to_string(),
+            Some(RestoreCaret {
+                doc_len: 0,
+                start: 0,
+                removed: 0,
+                inserted: text.encode_utf16().count(),
+            }),
+        )
+    } else {
+        let Some(pattern_ref) = text_pattern.as_ref() else {
+            // No caret information for a non-empty field; a blind SetValue
+            // would clobber the text.
+            return Ok(false);
+        };
+        match unsafe { caret_splice(pattern_ref, &current, text)? } {
+            Some((new_value, restore)) => (new_value, Some(restore)),
+            None => return Ok(false),
+        }
+    };
+    pattern
+        .SetValue(&BSTR::from(new_value.as_str()))
+        .map_err(|error| accessibility_error("value insertion", error))?;
+    if let (Some(text_pattern), Some(restore)) = (&text_pattern, restore) {
+        // Best effort: SetValue leaves WinUI controls with a selection their
+        // TextPattern refuses to move, which would make the next dictation
+        // miss the smart spacing. Re-seat the caret from a fresh range.
+        let _ = unsafe { restore_caret_at_end(text_pattern, &restore) };
+    }
+    Ok(true)
+}
+
+/// Where the caret belongs after a direct insert: at the end of the inserted
+/// text. All offsets in UTF-16 code units of the old document.
+struct RestoreCaret {
+    doc_len: usize,
+    start: usize,
+    removed: usize,
+    inserted: usize,
+}
+
+unsafe fn restore_caret_at_end(
+    pattern: &IUIAutomationTextPattern,
+    info: &RestoreCaret,
+) -> Result<()> {
+    let document = pattern
+        .DocumentRange()
+        .map_err(|error| accessibility_error("document range", error))?;
+    let caret = document
+        .Clone()
+        .map_err(|error| accessibility_error("caret range", error))?;
+    // Degenerate at the document end, then back up to the end of the text we
+    // just inserted (in the new document's coordinates).
+    caret
+        .MoveEndpointByRange(
+            TextPatternRangeEndpoint_Start,
+            &document,
+            TextPatternRangeEndpoint_End,
+        )
+        .map_err(|error| accessibility_error("caret range move", error))?;
+    let back =
+        (info.doc_len - info.removed + info.inserted).saturating_sub(info.start + info.inserted);
+    if back > 0 {
+        caret
+            .MoveEndpointByUnit(
+                TextPatternRangeEndpoint_Start,
+                TextUnit_Character,
+                -(back as i32),
+            )
+            .map_err(|error| accessibility_error("caret range move", error))?;
+        // Collapse onto the moved start: selecting [start, doc end] would
+        // leave the text after the insertion selected, and the next keystroke
+        // would delete it.
+        caret
+            .MoveEndpointByRange(
+                TextPatternRangeEndpoint_End,
+                &caret
+                    .Clone()
+                    .map_err(|error| accessibility_error("caret range", error))?,
+                TextPatternRangeEndpoint_Start,
+            )
+            .map_err(|error| accessibility_error("caret range move", error))?;
+    }
+    caret
+        .Select()
+        .map_err(|error| accessibility_error("caret restore", error))?;
+    Ok(())
+}
+
+/// Replacement text for the field value: `current` with the caret selection
+/// (in UTF-16 code units, from the TextPattern view) replaced by `text`, plus
+/// the caret-restore info. `Ok(None)` = no trustworthy caret, fall back to
+/// the clipboard.
+unsafe fn caret_splice(
+    pattern: &IUIAutomationTextPattern,
+    current: &str,
+    text: &str,
+) -> Result<Option<(String, RestoreCaret)>> {
+    let ranges = pattern
+        .GetSelection()
+        .map_err(|error| accessibility_error("text selection", error))?;
+    if ranges.Length().unwrap_or(0) != 1 {
+        return Ok(None);
+    }
+    let caret = ranges
+        .GetElement(0)
+        .map_err(|error| accessibility_error("caret range", error))?;
+    let document = pattern
+        .DocumentRange()
+        .map_err(|error| accessibility_error("document range", error))?;
+    let document_text = document
+        .GetText(-1)
+        .map_err(|error| accessibility_error("document text", error))?
+        .to_string();
+    if document_text != current || document_text.chars().count() > DIRECT_INSERT_MAX_CHARS {
+        return Ok(None);
+    }
+    // The caret offset is the length of [document start, selection start].
+    // CompareEndpoints only promises a sign (Chromium returns -1/0/1), so it
+    // cannot serve as an offset.
+    let prefix = document
+        .Clone()
+        .map_err(|error| accessibility_error("caret prefix range", error))?;
+    prefix
+        .MoveEndpointByRange(
+            TextPatternRangeEndpoint_End,
+            &caret,
+            TextPatternRangeEndpoint_Start,
+        )
+        .map_err(|error| accessibility_error("caret prefix range", error))?;
+    let prefix_text = prefix
+        .GetText(-1)
+        .map_err(|error| accessibility_error("caret prefix text", error))?
+        .to_string();
+    let selection = caret.GetText(-1).unwrap_or_default().to_string();
+    // Both pieces must line up with the value, or the offset is untrustworthy.
+    let Some(rest) = current.strip_prefix(prefix_text.as_str()) else {
+        return Ok(None);
+    };
+    if !rest.starts_with(selection.as_str()) {
+        return Ok(None);
+    }
+    let start = prefix_text.encode_utf16().count();
+    let removed = selection.encode_utf16().count();
+    let inserted = text.encode_utf16().count();
+    Ok(Some((
+        splice_utf16(current, start, start + removed, text),
+        RestoreCaret {
+            doc_len: document_text.encode_utf16().count(),
+            start,
+            removed,
+            inserted,
+        },
+    )))
+}
+
+/// Replace `value[start..end]` (UTF-16 code units) with `text`; an empty span
+/// inserts at the offset. UIA text offsets are UTF-16 based, so surrogate
+/// pairs are handled by counting, not by chars.
+fn splice_utf16(value: &str, start: usize, end: usize, text: &str) -> String {
+    let mut result = String::with_capacity(value.len() + text.len());
+    let mut consumed = 0usize;
+    let mut inserted = false;
+    for ch in value.chars() {
+        if !inserted && consumed >= start {
+            result.push_str(text);
+            inserted = true;
+        }
+        if !(consumed >= start && consumed < end) {
+            result.push(ch);
+        }
+        consumed += ch.len_utf16();
+    }
+    if !inserted {
+        result.push_str(text);
+    }
+    result
+}
+
+const EM_REPLACESEL: u32 = 0x00C2;
+const ES_READONLY: i32 = 0x0800;
+
+/// Insert at the caret of a classic Win32 Edit / RichEdit control with an
+/// undoable `EM_REPLACESEL` (the window manager marshals it across processes).
+/// `None` = not such a control, try UI Automation; `Some(false)` = read-only
+/// or the message could not be sent at all, fall back to the clipboard.
+unsafe fn win32_edit_replace_selection(hwnd: HWND, text: &str) -> Option<bool> {
+    if hwnd.0.is_null() {
+        return None;
+    }
+    let class = window_class(hwnd);
+    let is_edit =
+        class.eq_ignore_ascii_case("Edit") || class.to_ascii_lowercase().starts_with("richedit");
+    if !is_edit {
+        return None;
+    }
+    if GetWindowLongW(hwnd, GWL_STYLE) & ES_READONLY != 0 {
+        return Some(false);
+    }
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    // SMTO_NORMAL, not SMTO_ABORTIFHUNG: a timeout must always mean "sent".
+    // The message is not cancelled when the wait runs out; a slow (or briefly
+    // hung) target still inserts the text once it catches up, so falling back
+    // to paste then would insert it twice.
+    let sent = SendMessageTimeoutW(
+        hwnd,
+        EM_REPLACESEL,
+        WPARAM(1), // can undo
+        LPARAM(wide.as_ptr() as isize),
+        SMTO_NORMAL,
+        1_000,
+        None,
+    );
+    if sent.0 != 0 {
+        tracing::info!(class = %class, "inserted via EM_REPLACESEL");
+        return Some(true);
+    }
+    if GetLastError() == ERROR_TIMEOUT {
+        tracing::warn!(class = %class, "EM_REPLACESEL timed out; the target will apply it late");
+        return Some(true);
+    }
+    Some(false)
 }
 
 /// How long the dictated text stays on the clipboard after Ctrl+V. Targets read
@@ -946,6 +1266,16 @@ impl Drop for WinHookHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splice_utf16_replaces_spans_and_appends() {
+        assert_eq!(splice_utf16("hello", 2, 2, "X"), "heXllo");
+        assert_eq!(splice_utf16("hello", 1, 3, "X"), "hXlo");
+        // A surrogate pair counts as two UTF-16 units and is removed whole.
+        assert_eq!(splice_utf16("a😀b", 1, 3, "x"), "axb");
+        assert_eq!(splice_utf16("abc", 5, 5, "Z"), "abcZ");
+        assert_eq!(splice_utf16("", 0, 0, "hi"), "hi");
+    }
 
     #[test]
     fn hotkey_names_parse() {
