@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { toast, Toaster } from "sonner";
+import { Toaster } from "sonner";
 import { api, events, missingProfileStatus, type ApiStatus, type Mode, type SessionState, type Settings } from "./lib/api";
+import { notify, installToastSweeper } from "./lib/notify";
 import { useTheme, normalizeThemePreference } from "./lib/theme";
 import { makeT, resolveLocale } from "./i18n";
 import { localizeMessage } from "./lib/messages";
@@ -60,6 +61,7 @@ export default function App() {
   }, [navigate]);
 
   useEffect(() => {
+    installToastSweeper();
     void refreshSettings().catch((cause) => setLoadError(String(cause)));
     void refreshStatus();
     void refreshPending();
@@ -73,8 +75,8 @@ export default function App() {
       const current = resolveLocale(localeRef.current);
       return localizeMessage(message, current, makeT(current));
     };
-    void events.onSessionWarning((message) => toast.warning(localized(message))).then((u) => unlisteners.push(u));
-    void events.onSessionError((message) => toast.error(localized(message))).then((u) => unlisteners.push(u));
+    void events.onSessionWarning((message) => notify.warning(localized(message))).then((u) => unlisteners.push(u));
+    void events.onSessionError((message) => notify.error(localized(message))).then((u) => unlisteners.push(u));
     void events.onSettingsChanged((next) => {
       setSettings(next);
       setMode(next.dictation.default_mode ?? "dictate");
@@ -87,7 +89,7 @@ export default function App() {
       }
       const valid: SessionState[] = ["idle", "starting", "recording", "processing", "cancelling", "error"];
       setSession(valid.includes(event.state as SessionState) ? event.state as SessionState : "idle");
-      if (event.state === "error" && event.message) toast.error(localized(event.message));
+      if (event.state === "error" && event.message) notify.error(localized(event.message));
       if (event.state === "idle") { activeSessionId.current = null; setLevel(0); void refreshPending(); }
     }).then((u) => unlisteners.push(u));
     void events.onSessionLevel((value) => setLevel(value)).then((u) => unlisteners.push(u));
@@ -99,7 +101,7 @@ export default function App() {
     }).then((u) => unlisteners.push(u));
     void events.onUpdaterAvailable((update) => {
       const t = makeT(resolveLocale(localeRef.current));
-      toast.info(t("settings.updateToast", { version: update.version }), {
+      notify.info(t("settings.updateToast", { version: update.version }), {
         duration: 15000,
         action: {
           label: t("settings.updateToastAction"),
@@ -137,10 +139,10 @@ export default function App() {
     try {
       const handle = await api.sessionStart({ mode, target_language: mode === "translate" ? targetLanguage : null, source: "ui" });
       activeSessionId.current = handle.session_id;
-    } catch (cause) { toast.error(String(cause)); }
+    } catch (cause) { notify.error(String(cause)); }
   }, [mode, targetLanguage]);
   const cancelSession = useCallback(async () => {
-    try { await api.cancel(); } catch (cause) { toast.error(String(cause)); }
+    try { await api.cancel(); } catch (cause) { notify.error(String(cause)); }
   }, []);
 
   if (loadError) {
@@ -186,7 +188,7 @@ export default function App() {
         >
           {tab === "home" && <HomePage settings={settings} apiStatus={apiStatus} permissions={permissions} session={session} mode={mode} targetLanguage={targetLanguage} level={level} pendingCount={pendingCount} locale={locale} t={t} onOpenSettings={() => openSettings("providers")} onOpenHistory={() => navigate("history")} onModeChange={setMode} onTargetChange={setTargetLanguage} onStart={() => void startSession()} onCancel={() => void cancelSession()} onOpenHotkeys={() => openSettings("modes")} onRefreshPermissions={refreshPermissions} />}
           {tab === "history" && <HistoryList locale={locale} t={t} hotkey={settings.hotkey.dictate} />}
-          {tab === "settings" && <SettingsPanel settings={settings} apiStatus={apiStatus} t={t} locale={locale} onSave={saveSettings} onError={(message) => toast.error(message)} onChanged={refreshSettings} onApiStatusChanged={refreshStatus} section={settingsSection} />}
+          {tab === "settings" && <SettingsPanel settings={settings} apiStatus={apiStatus} t={t} locale={locale} onSave={saveSettings} onError={(message) => notify.error(message)} onChanged={refreshSettings} onApiStatusChanged={refreshStatus} section={settingsSection} />}
         </AppShell>
       )}
       <Toaster theme={normalizeThemePreference(settings.ui.theme)} position="bottom-right" richColors closeButton />

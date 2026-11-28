@@ -6,7 +6,7 @@ import {
 import {
   api, events, type HistoryEntry, type HistoryQuery, type Mode, type PendingRecord,
 } from "../lib/api";
-import { toast } from "sonner";
+import { notify } from "../lib/notify";
 import { localizeHotkey, type Locale, type MessageKey, type TFunc } from "../i18n";
 import { formatWhen } from "../lib/format";
 import { localizeMessage } from "../lib/messages";
@@ -108,9 +108,9 @@ export default function HistoryList({ locale, t, hotkey = "right-alt" }: { local
   }, [load]);
 
   // Action failures go to a toast; the inline banner is kept for load failures.
-  const fail = (cause: unknown) => { toast.error(String(cause)); };
+  const fail = (cause: unknown) => { notify.error(String(cause)); };
   const copy = async (text: string) => {
-    try { await api.copyText(text); toast.success(t("common.copied")); } catch (cause) { fail(cause); }
+    try { await api.copyText(text); notify.success(t("common.copied")); } catch (cause) { fail(cause); }
   };
   const pin = async (entry: HistoryEntry) => {
     try {
@@ -146,7 +146,7 @@ export default function HistoryList({ locale, t, hotkey = "right-alt" }: { local
     setRetrying((current) => new Set(current).add(record.id));
     try {
       await api.pendingRetry(record.id);
-      toast.success(t("history.pendingRetried"));
+      notify.success(t("history.pendingRetried"));
       // The recovered text is a new history entry, not just a removed row.
       await load();
     } catch (cause) {
@@ -163,7 +163,7 @@ export default function HistoryList({ locale, t, hotkey = "right-alt" }: { local
     setDictionaryOpen(true);
   };
   const exportAudio = async (id: string) => {
-    try { if (await api.historyExportAudio(id)) toast.success(t("history.audioExported")); } catch (cause) { fail(cause); }
+    try { if (await api.historyExportAudio(id)) notify.success(t("history.audioExported")); } catch (cause) { fail(cause); }
   };
   const discardPending = async () => {
     if (!discardTarget) return;

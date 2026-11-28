@@ -871,10 +871,18 @@ pub fn bootstrap(app: &AppHandle) -> ovt_core::Result<()> {
     let dir = app_data_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|e| ovt_core::Error::Config(format!("app data dir: {e}")))?;
-    let config = Arc::new(
-        ConfigStore::load(dir.join("settings.json"), Arc::new(SystemCredentialStore))
-            .map_err(ovt_core::Error::Config)?,
-    );
+    let (config, reset_error) =
+        ConfigStore::load_or_reset(dir.join("settings.json"), Arc::new(SystemCredentialStore))
+            .map_err(ovt_core::Error::Config)?;
+    let config = Arc::new(config);
+    if let Some(error) = reset_error {
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog()
+            .message(format!(
+                "Settings could not be loaded and were reset to defaults. A copy of the broken file was kept next to it as settings.invalid.backup*.json.\n\n{error}"
+            ))
+            .blocking_show();
+    }
     let settings = config.snapshot().map_err(ovt_core::Error::Config)?;
     let history = match ovt_core::history::HistoryRepo::open(&dir.join("history.db")) {
         Ok(repo) => {

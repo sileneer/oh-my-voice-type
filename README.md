@@ -29,7 +29,7 @@ Verify installer checksums against `SHA256SUMS.txt` attached to each release.
 
 1. **Settings → Providers**: choose a speech recognition provider (Groq, Mistral, OpenAI, OpenRouter, SiliconFlow, StepFun, Unisound, or Zhipu GLM), then enter its API key. Endpoints and models are prefilled, and once a valid key is entered the model picker loads live models from the provider's `/models` endpoint. Use **Advanced options** for any custom endpoint.
 2. **AI cleanup** uses the same flow with built-in presets or any custom OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages endpoint. It is optional; without it, dictation inserts the raw transcript.
-3. **Home**: pick the dictation hotkey (Windows default `Right Alt`; macOS default `Right Option`), choose hold/tap smart gestures, click *Test a dictation* and speak.
+3. **Home**: pick the dictation hotkey (Windows default `Right Alt`; macOS default `Right Option`, with Fn/Globe also available via an IOHIDManager tap), choose hold/tap smart gestures, click *Test a dictation* and speak.
 
 ## Stack
 
@@ -136,8 +136,9 @@ Signing: the updater public key is in `tauri.conf.json` and the private key live
 ## Status / known limits (v1)
 
 - Dictate, Translate, and Edit Selection modes are wired end-to-end, backed by a crash-safe SQLite pending recovery queue (`pending_*`).
-- Insertion: clipboard + synthetic paste with clipboard restore and per-app terminal routing; direct AX (macOS) / UIA (Windows) caret insertion is planned for milestone 2.
+- Insertion: direct AX (macOS `AXSelectedText`, verified) / Win32 `EM_REPLACESEL` or UIA value pattern (Windows) writes at the caret when the target supports them, falling back to clipboard + synthetic paste with clipboard restore and per-app terminal routing; the transcript is never lost.
 - Wayland/Linux and mobile hosts are phase 2/3 (the core crate is already host-agnostic).
+- The global hotkey is observed, not swallowed: it still reaches the focused app, so function-key bindings can collide with app shortcuts (F8 is "Go to Next Problem" in VS Code). Prefer a modifier key or one your apps don't use.
 - Windows code signing (Azure Trusted Signing / SignPath) and macOS Developer ID signing + notarization are not configured yet; updater artifacts are signed separately.
 
 ## License

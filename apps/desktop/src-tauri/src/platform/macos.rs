@@ -1,9 +1,10 @@
 //! macOS integration:
-//! - `MacInserter`: accessibility-first text insertion with clipboard
-//!   (save/restore) + synthesized ⌘V fallback via CGEvent.
+//! - `MacInserter`: AX direct set at the caret (strategy ladder level 1),
+//!   with clipboard (save/restore) + synthesized ⌘V fallback via CGEvent.
 //! - `MacContext`: front app identity and Accessibility selection queries.
-//! - `MacHotkey`: CGEventTap driven by the shared gesture decoder;
-//!   supports bare modifier keys (Right Option default, Fn via vendor HID).
+//! - `MacHotkey`: CGEventTap driven by the shared gesture decoder for bare
+//!   modifier keys (Right Option default); Fn/Globe goes through an
+//!   IOHIDManager tap (vendor HID usage, needs Input Monitoring).
 //!
 //! Note: this file compiles only on macOS; CI cross-checks it on that host.
 
@@ -15,8 +16,12 @@ use std::sync::mpsc::sync_channel;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use core_foundation::base::{CFIndex, CFRange, CFRelease, CFTypeRef, TCFType};
-use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+use core_foundation::base::{CFAllocatorRef, CFIndex, CFRange, CFRelease, CFTypeRef, TCFType};
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+use core_foundation::number::{CFNumber, CFNumberRef};
+use core_foundation::runloop::{
+    kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop, CFRunLoopRef,
+};
 use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::event::{
     CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -83,6 +88,7 @@ extern "C" {
         parameter: CFTypeRef,
         value: *mut CFTypeRef,
     ) -> i32;
+    fn AXUIElementCreateSystemWide() -> AXUIElementRef;
     fn AXValueGetValue(value: CFTypeRef, value_type: u32, out: *mut std::ffi::c_void) -> bool;
     fn AXValueCreate(value_type: u32, value: *const std::ffi::c_void) -> CFTypeRef;
 }
@@ -121,9 +127,13 @@ impl TextInserter for MacInserter {
         if text.is_empty() {
             return Ok(());
         }
-        // Accessibility AX insertion is the most robust macOS path; it needs
-        // per-element work that lives in the follow-up context milestone.
-        // v1 = clipboard + ⌘V (exactly what Typeless ships today).
+        // Strategy ladder level 1: set AXSelectedText on the focused element —
+        // an empty selection inserts at the caret, a selection is replaced.
+        // Apps without AX text support (and every failure mode) fall through
+        // to the clipboard + ⌘V ladder below, which was the v1 path.
+        if accessibility_trusted() && unsafe { try_ax_insert(text) } {
+            return Ok(());
+        }
         let previous = clipboard_get_text();
         clipboard_set_text(text)?;
         std::thread::sleep(Duration::from_millis(20));
@@ -144,6 +154,113 @@ impl TextInserter for MacInserter {
     fn copy(&self, text: &str) -> Result<()> {
         clipboard_set_text(text)
     }
+}
+
+/// Strategy ladder level 1: set `AXSelectedText` on the focused element.
+/// `false` = the element does not accept AX text edits (or the AX query
+/// failed); the caller falls back to the clipboard + ⌘V ladder.
+unsafe fn try_ax_insert(text: &str) -> bool {
+    let systemwide = AXUIElementCreateSystemWide();
+    if systemwide.is_null() {
+        return false;
+    }
+    let focused = match focused_element(systemwide) {
+        Ok(focused) => focused,
+        Err(_) => {
+            CFRelease(systemwide as CFTypeRef);
+            return false;
+        }
+    };
+    CFRelease(systemwide as CFTypeRef);
+    if focused.is_null() {
+        return false;
+    }
+    let role = ax_string(focused, "AXRole").unwrap_or_default();
+    let subrole = ax_string(focused, "AXSubrole").unwrap_or_default();
+    if role.contains("Secure") || subrole.contains("Secure") {
+        CFRelease(focused as CFTypeRef);
+        return false;
+    }
+    // Several hosts (Chromium/Electron web content, some Qt and Java apps)
+    // report success for an AXSelectedText write they ignore, so success is
+    // only trusted once the element visibly changed. Without a readable
+    // baseline there is nothing to verify against: use the clipboard ladder.
+    let (Some(count_before), Some(range_before)) =
+        (ax_character_count(focused), ax_selected_range(focused))
+    else {
+        CFRelease(focused as CFTypeRef);
+        return false;
+    };
+    let attribute = CFString::new("AXSelectedText");
+    let value = CFString::new(text);
+    let result = AXUIElementSetAttributeValue(
+        focused,
+        attribute.as_concrete_TypeRef(),
+        value.as_concrete_TypeRef() as CFTypeRef,
+    );
+    let inserted = result == 0 && ax_edit_observed(focused, count_before, range_before);
+    CFRelease(focused as CFTypeRef);
+    inserted
+}
+
+/// Wait briefly for the AX write to show up: Chromium applies it
+/// asynchronously in the renderer. Any change to the character count or the
+/// selection counts as applied, so a slow but successful write is never
+/// pasted a second time; no change at all means the write was ignored.
+unsafe fn ax_edit_observed(
+    element: AXUIElementRef,
+    count_before: CFIndex,
+    range_before: CFRange,
+) -> bool {
+    for attempt in 0..12 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let count = ax_character_count(element);
+        let range = ax_selected_range(element);
+        let count_changed = count.is_some_and(|count| count != count_before);
+        let range_changed = range.is_some_and(|range| {
+            range.location != range_before.location || range.length != range_before.length
+        });
+        if count_changed || range_changed {
+            return true;
+        }
+    }
+    tracing::info!("AXSelectedText write had no visible effect; falling back to paste");
+    false
+}
+
+unsafe fn ax_character_count(element: AXUIElementRef) -> Option<CFIndex> {
+    let attribute = CFString::new("AXNumberOfCharacters");
+    let mut value: CFTypeRef = std::ptr::null();
+    if AXUIElementCopyAttributeValue(element, attribute.as_concrete_TypeRef(), &mut value) != 0
+        || value.is_null()
+    {
+        return None;
+    }
+    let count = CFNumber::wrap_under_create_rule(value as CFNumberRef).to_i64();
+    count.map(|count| count as CFIndex)
+}
+
+unsafe fn ax_selected_range(element: AXUIElementRef) -> Option<CFRange> {
+    let attribute = CFString::new("AXSelectedTextRange");
+    let mut value: CFTypeRef = std::ptr::null();
+    if AXUIElementCopyAttributeValue(element, attribute.as_concrete_TypeRef(), &mut value) != 0
+        || value.is_null()
+    {
+        return None;
+    }
+    let mut range = CFRange {
+        location: 0,
+        length: 0,
+    };
+    let read = AXValueGetValue(
+        value,
+        AX_VALUE_CF_RANGE,
+        &mut range as *mut CFRange as *mut std::ffi::c_void,
+    );
+    CFRelease(value);
+    read.then_some(range)
 }
 
 fn clipboard_set_text(text: &str) -> Result<()> {
@@ -435,6 +552,12 @@ impl HotkeyListener for MacHotkey {
         smart: bool,
         callback: HotkeyCallback,
     ) -> Result<Box<dyn HotkeyHandle + Send + Sync>> {
+        if key.trim().eq_ignore_ascii_case("fn") {
+            // The Fn/Globe key is a vendor HID usage, not a keycode: CGEventTap
+            // only reports a bare SecondaryFn flag flip without key codes, so
+            // its tap lives one layer lower, at IOHIDManager.
+            return self.start_fn_tap(smart, callback);
+        }
         let mask = flags_mask_for(key)?;
         let (tx, rx) = sync_channel::<Result<CFRunLoop>>(1);
 
@@ -535,20 +658,226 @@ impl HotkeyListener for MacHotkey {
     }
 }
 
+impl MacHotkey {
+    /// IOHIDManager tap for the Fn/Globe key; see the FFI block below for why
+    /// CGEventTap cannot serve it. Needs Input Monitoring.
+    fn start_fn_tap(
+        &self,
+        smart: bool,
+        callback: HotkeyCallback,
+    ) -> Result<Box<dyn HotkeyHandle + Send + Sync>> {
+        let (tx, rx) = sync_channel::<Result<CFRunLoop>>(1);
+        std::thread::spawn(move || {
+            // Owned by this thread; the HID callbacks only fire while the run
+            // loop below is running, so the raw pointer stays valid.
+            let context = Box::new(FnTapContext {
+                decoder: Mutex::new((
+                    GestureDecoder::new(Duration::from_millis(350), smart),
+                    false,
+                )),
+                callback,
+            });
+            let manager = unsafe { IOHIDManagerCreate(std::ptr::null(), 0) };
+            if manager.is_null() {
+                let _ = tx.send(Err(ovt_core::Error::Unsupported(
+                    "IOHIDManagerCreate failed".into(),
+                )));
+                return;
+            }
+            let matching = CFDictionary::from_CFType_pairs(&[
+                (CFString::new("DeviceUsagePage"), CFNumber::from(1)), // GenericDesktop
+                (CFString::new("DeviceUsage"), CFNumber::from(6)),     // Keyboard
+            ]);
+            unsafe {
+                IOHIDManagerSetDeviceMatching(manager, matching.as_concrete_TypeRef());
+                IOHIDManagerScheduleWithRunLoop(
+                    manager,
+                    CFRunLoop::get_current().as_concrete_TypeRef(),
+                    kCFRunLoopDefaultMode,
+                );
+                IOHIDManagerRegisterInputValueCallback(
+                    manager,
+                    fn_tap_value_callback,
+                    &*context as *const FnTapContext as *mut std::ffi::c_void,
+                );
+            }
+            let opened = unsafe { IOHIDManagerOpen(manager, 0) };
+            if opened != 0 {
+                unsafe { CFRelease(manager as CFTypeRef) };
+                let _ = tx.send(Err(ovt_core::Error::Unsupported(
+                    "IOHIDManagerOpen failed: grant Input Monitoring in System Settings".into(),
+                )));
+                return;
+            }
+            let run_loop = CFRunLoop::get_current();
+            let _ = tx.send(Ok(run_loop.clone()));
+            CFRunLoop::run_current();
+            unsafe {
+                IOHIDManagerClose(manager, 0);
+                CFRelease(manager as CFTypeRef);
+            }
+        });
+        let run_loop = rx.recv().map_err(|_| {
+            ovt_core::Error::Unsupported("IOHIDManager thread exited early".into())
+        })??;
+        Ok(Box::new(MacHookHandle { run_loop }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fn/Globe hotkey via IOHIDManager
+// ---------------------------------------------------------------------------
+
+type IOHIDManagerRef = *mut std::ffi::c_void;
+type IOHIDValueRef = *mut std::ffi::c_void;
+type IOHIDElementRef = *mut std::ffi::c_void;
+
+/// `kHIDPage_KeyboardOrKeypad`.
+const HID_PAGE_KEYBOARD: u32 = 0x07;
+/// `kHIDPage_AppleVendorTopCase`: Fn on built-in MacBook keyboards.
+const HID_PAGE_APPLE_VENDOR_TOP_CASE: u32 = 0xFF;
+/// `kHIDPage_AppleVendorKeyboard`: Fn/Globe on Magic Keyboards.
+const HID_PAGE_APPLE_VENDOR_KEYBOARD: u32 = 0xFF01;
+/// `kHIDUsage_AV_TopCase_KeyboardFn` and `kHIDUsage_AppleVendorKeyboard_Function`
+/// (both 0x03 on their pages). Not 0x3F: that is the virtual keycode
+/// `kVK_Function`, and on the keyboard page 0x3F is F6.
+const HID_USAGE_APPLE_FN: u32 = 0x03;
+/// `kHIDUsage_KeyboardEscape`.
+const HID_USAGE_KEYBOARD_ESCAPE: u32 = 0x29;
+/// Real key usages on the keyboard page (`a` through right GUI); below are the
+/// error/rollover codes, above are array sentinels.
+const HID_KEYBOARD_KEYS: std::ops::RangeInclusive<u32> = 0x04..=0xE7;
+
+fn is_apple_fn(page: u32, usage: u32) -> bool {
+    matches!(
+        page,
+        HID_PAGE_APPLE_VENDOR_TOP_CASE | HID_PAGE_APPLE_VENDOR_KEYBOARD
+    ) && usage == HID_USAGE_APPLE_FN
+}
+
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IOHIDManagerCreate(allocator: CFAllocatorRef, options: u32) -> IOHIDManagerRef;
+    fn IOHIDManagerSetDeviceMatching(manager: IOHIDManagerRef, matching: CFDictionaryRef);
+    fn IOHIDManagerScheduleWithRunLoop(
+        manager: IOHIDManagerRef,
+        run_loop: CFRunLoopRef,
+        mode: CFStringRef,
+    );
+    fn IOHIDManagerOpen(manager: IOHIDManagerRef, options: u32) -> i32;
+    fn IOHIDManagerClose(manager: IOHIDManagerRef, options: u32) -> i32;
+    fn IOHIDManagerRegisterInputValueCallback(
+        manager: IOHIDManagerRef,
+        callback: IOHIDValueCallback,
+        context: *mut std::ffi::c_void,
+    );
+    fn IOHIDValueGetElement(value: IOHIDValueRef) -> IOHIDElementRef;
+    fn IOHIDValueGetIntegerValue(value: IOHIDValueRef) -> CFIndex;
+    fn IOHIDElementGetUsagePage(element: IOHIDElementRef) -> u32;
+    fn IOHIDElementGetUsage(element: IOHIDElementRef) -> u32;
+}
+
+type IOHIDValueCallback = unsafe extern "C" fn(
+    context: *mut std::ffi::c_void,
+    result: i32,
+    sender: *mut std::ffi::c_void,
+    value: IOHIDValueRef,
+);
+
+struct FnTapContext {
+    decoder: Mutex<(GestureDecoder, bool)>,
+    callback: HotkeyCallback,
+}
+
+unsafe fn handle_fn_tap_value(context: *mut std::ffi::c_void, value: IOHIDValueRef) {
+    let Some(context) = (context as *const FnTapContext).as_ref() else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    let element = IOHIDValueGetElement(value);
+    if element.is_null() {
+        return;
+    }
+    let page = IOHIDElementGetUsagePage(element);
+    let usage = IOHIDElementGetUsage(element);
+    let fn_key = is_apple_fn(page, usage);
+    if !fn_key && (page != HID_PAGE_KEYBOARD || !HID_KEYBOARD_KEYS.contains(&usage)) {
+        return;
+    }
+    let down = IOHIDValueGetIntegerValue(value) != 0;
+    let mut state = context
+        .decoder
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (ref mut decoder, ref mut was_down) = *state;
+    match usage {
+        _ if fn_key => {
+            let edge = match (down, *was_down) {
+                (true, false) => Some(Edge::Down),
+                (false, true) => Some(Edge::Up),
+                _ => None,
+            };
+            *was_down = down;
+            if edge == Some(Edge::Down) {
+                decoder.sync_session(SESSION_ACTIVE.load(Ordering::SeqCst));
+            }
+            if let Some(edge) = edge {
+                if let Some(event) = decoder.on_edge(edge, std::time::Instant::now()) {
+                    (context.callback)(event);
+                }
+            }
+        }
+        HID_USAGE_KEYBOARD_ESCAPE if down && SESSION_ACTIVE.load(Ordering::SeqCst) => {
+            decoder.reset();
+            *was_down = false;
+            (context.callback)(ovt_core::hotkey::HotkeyEvent::Cancel);
+        }
+        _ if *was_down => {
+            // Another key arrives while Fn is held: a chord, not a tap.
+            if let Some(event) = decoder.note_other_key() {
+                (context.callback)(event);
+            }
+        }
+        _ => {}
+    }
+}
+
+unsafe extern "C" fn fn_tap_value_callback(
+    context: *mut std::ffi::c_void,
+    _result: i32,
+    _sender: *mut std::ffi::c_void,
+    value: IOHIDValueRef,
+) {
+    handle_fn_tap_value(context, value);
+}
+
 fn flags_mask_for(key: &str) -> Result<CGEventFlags> {
     Ok(match key.trim().to_lowercase().as_str() {
         "right-opt" | "right-option" | "ropt" => CGEventFlags::CGEventFlagAlternate,
         "right-cmd" | "right-command" | "rcmd" => CGEventFlags::CGEventFlagCommand,
         "right-ctrl" | "right-control" => CGEventFlags::CGEventFlagControl,
         "right-shift" => CGEventFlags::CGEventFlagShift,
-        // Fn/Globe is a vendor HID key on macOS and needs an IOHIDManager tap;
-        // for v1 default to Right Option (documented; matches Typeless's
-        // external-keyboard guidance).
-        "fn" => CGEventFlags::CGEventFlagSecondaryFn,
+        // "fn" never reaches here: start() routes it to the IOHIDManager tap.
         other => {
             return Err(ovt_core::Error::Config(format!(
-                "unsupported macOS hotkey {other:?} (right-opt, right-cmd, right-ctrl, right-shift)"
+                "unsupported macOS hotkey {other:?} (right-opt, right-cmd, right-ctrl, right-shift, fn)"
             )))
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fn_key_matches_apple_vendor_usages_only() {
+        assert!(is_apple_fn(HID_PAGE_APPLE_VENDOR_TOP_CASE, 0x03));
+        assert!(is_apple_fn(HID_PAGE_APPLE_VENDOR_KEYBOARD, 0x03));
+        // 0x3F on the keyboard page is F6, not Fn.
+        assert!(!is_apple_fn(HID_PAGE_KEYBOARD, 0x3F));
+        assert!(!is_apple_fn(HID_PAGE_KEYBOARD, 0x03));
+    }
 }

@@ -7,7 +7,7 @@ import packageJson from "../../package.json";
 import {
   api, events, type ApiStatus, type DictionaryEntry, type Mode, type Settings,
 } from "../lib/api";
-import { toast } from "sonner";
+import { notify } from "../lib/notify";
 import { localeOptions, localizeHotkey, translationTargets, type Locale, type TFunc } from "../i18n";
 import { normalizeThemePreference, themeOptions, useTheme } from "../lib/theme";
 import { hotkeyOptions } from "../lib/hotkeys";
@@ -45,7 +45,7 @@ export default function SettingsPanel({ settings, apiStatus, t, locale, onSave, 
   const configurationChanged = async () => { await onChanged(); await onApiStatusChanged(); };
   const save = async (next: Settings) => {
     await onSave(next);
-    toast.success(t("settings.savedToast"));
+    notify.success(t("settings.savedToast"));
   };
   const sections = [
     { id: "general", label: t("settings.general"), icon: Palette },

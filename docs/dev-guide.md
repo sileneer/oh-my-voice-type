@@ -33,7 +33,7 @@ Prompts are product surface; changes require golden test updates in `crates/ovt-
 - preserve wording unless cleanup settings say otherwise.
 
 ## Insertion strategy ladder
-1. (roadmap) AX direct set on macOS / UI Automation on Windows.
+1. Direct set, no clipboard: macOS sets `AXSelectedText` on the focused element (empty selection = caret insert) and trusts it only once `AXNumberOfCharacters` or `AXSelectedTextRange` changes (polled ~300 ms, since Chromium applies it asynchronously and some hosts report success for ignored writes). Windows sends an undoable `EM_REPLACESEL` to classic Edit/RichEdit controls; other controls get their UI Automation value written (empty field = the text, only when the TextPattern document is empty too; otherwise a caret splice, only when the TextPattern document view matches the value exactly — UTF-16 offsets measured from the document-start-to-caret range, selections replaced). Read-only fields are skipped. Any failure or unsupported control falls through to level 2.
 2. Clipboard write → save user clipboard → synthesized paste → restore only if untouched. Per-app routing: terminals get Shift+Insert (Windows consols / mintty / Windows Terminal), everything else Ctrl+V / ⌘V.
 3. Clipboard-only fallback with explicit status; the transcript is never lost.
 
