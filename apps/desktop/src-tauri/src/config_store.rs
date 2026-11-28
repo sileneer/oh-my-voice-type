@@ -78,6 +78,29 @@ fn endpoint_host(url: Option<&str>) -> Option<String> {
         .map(|host| host.to_string())
 }
 
+/// Whether a settings file failed to load because of its content (and so may
+/// be reset), as opposed to an environment failure such as a keychain error
+/// during migration. Only the current schema and the unversioned legacy
+/// format are judged; other versions are never considered corrupt.
+fn settings_content_is_corrupt(raw: &[u8]) -> bool {
+    let Ok(raw) = std::str::from_utf8(raw) else {
+        return true;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return true;
+    };
+    match value.get("schema_version") {
+        None => serde_json::from_value::<LegacySettings>(value).is_err(),
+        Some(version)
+            if version.as_u64() == Some(u64::from(ovt_core::config::SETTINGS_SCHEMA_VERSION)) =>
+        {
+            serde_json::from_value::<Settings>(value)
+                .map_or(true, |settings| settings.validate().is_err())
+        }
+        Some(_) => false,
+    }
+}
+
 fn save_path(path: &Path, settings: &Settings) -> Result<(), String> {
     settings.validate().map_err(|e| e.to_string())?;
     if let Some(parent) = path.parent() {
@@ -178,6 +201,50 @@ impl ConfigStore {
             settings: Mutex::new(settings),
             vault,
         })
+    }
+
+    /// Like [`Self::load`], but recovers from a corrupt settings file with
+    /// defaults instead of failing startup (which aborted with a dialog and a
+    /// panic). Returns the error that triggered the reset so the caller can
+    /// tell the user. Only a file whose content cannot be parsed or validated
+    /// is reset, and only after a backup copy was written. Everything else is
+    /// still fatal and leaves the file alone: read errors (a sync client or
+    /// antivirus lock), keychain or save failures while migrating, and any
+    /// other schema version (resetting would discard settings a newer app
+    /// version wrote, or a migration that failed for a transient reason).
+    pub fn load_or_reset(
+        path: PathBuf,
+        vault: Arc<dyn CredentialStore>,
+    ) -> Result<(Self, Option<String>), String> {
+        match Self::load(path.clone(), Arc::clone(&vault)) {
+            Ok(store) => Ok((store, None)),
+            Err(error) => {
+                let Ok(raw) = std::fs::read(&path) else {
+                    return Err(error);
+                };
+                if !settings_content_is_corrupt(&raw) {
+                    return Err(error);
+                }
+                // Never overwrite an earlier backup: it may hold the only copy
+                // of the user's real settings from a previous reset.
+                let mut backup = path.with_file_name("settings.invalid.backup.json");
+                if backup.exists() {
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_millis())
+                        .unwrap_or_default();
+                    backup = path.with_file_name(format!("settings.invalid.backup-{stamp}.json"));
+                }
+                std::fs::write(&backup, &raw).map_err(|backup_error| {
+                    format!("{error} (the settings were not reset: cannot back them up: {backup_error})")
+                })?;
+                std::fs::remove_file(&path).map_err(|remove_error| {
+                    format!("{error} (the settings were not reset: {remove_error})")
+                })?;
+                let store = Self::load(path, vault)?;
+                Ok((store, Some(error)))
+            }
+        }
     }
 
     pub fn snapshot(&self) -> Result<Settings, String> {
@@ -703,10 +770,12 @@ mod tests {
     }
 
     fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "ovt-config-test-{}-{name}.json",
-            uuid::Uuid::new_v4()
-        ))
+        // A unique directory per test, not just per file: the load-reset
+        // backup uses a fixed sibling name, so shared directories would leak
+        // state between tests.
+        let dir = std::env::temp_dir().join(format!("ovt-config-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(format!("{name}.json"))
     }
 
     #[test]
@@ -721,6 +790,76 @@ mod tests {
             .save_asr_profile(AsrProfile::default(), Some("secret".into()), false)
             .is_err());
         assert!(store.snapshot().unwrap().asr_profiles.is_empty());
+    }
+
+    #[test]
+    fn broken_settings_reset_to_defaults_and_are_backed_up() {
+        let path = temp_path("broken");
+        let raw = r#"{"schema_version":3,"llm_profiles":[{"id":"x","format":"openai_chat"}]}"#;
+        std::fs::write(&path, raw).unwrap();
+        let (store, error) = ConfigStore::load_or_reset(path.clone(), MemoryVault::new()).unwrap();
+        let error = error.expect("load_or_reset should report the reset");
+        assert!(error.contains("invalid settings"), "got {error:?}");
+        let backup = path.with_file_name("settings.invalid.backup.json");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), raw);
+        let settings = store.snapshot().unwrap();
+        assert_eq!(settings.hotkey.dictate, Settings::default().hotkey.dictate);
+        assert!(settings.llm_profiles.is_empty());
+        assert_eq!(settings.ui.onboarding_completed, Some(false));
+    }
+
+    #[test]
+    fn unreadable_settings_fail_without_reset() {
+        // A directory where the file should be: load fails on the read, not
+        // the content, so nothing may be deleted or reset.
+        let path = temp_path("unreadable");
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(ConfigStore::load_or_reset(path.clone(), MemoryVault::new()).is_err());
+        assert!(path.is_dir());
+        assert!(!path.with_file_name("settings.invalid.backup.json").exists());
+    }
+
+    #[test]
+    fn invalid_json_settings_reset_to_defaults() {
+        let path = temp_path("invalid-json");
+        std::fs::write(&path, "{not json").unwrap();
+        let (_, error) = ConfigStore::load_or_reset(path.clone(), MemoryVault::new()).unwrap();
+        assert!(error.unwrap().contains("invalid settings JSON"));
+        assert_eq!(
+            std::fs::read_to_string(path.with_file_name("settings.invalid.backup.json")).unwrap(),
+            "{not json"
+        );
+    }
+
+    #[test]
+    fn second_reset_keeps_the_first_backup() {
+        let path = temp_path("second-reset");
+        let backup = path.with_file_name("settings.invalid.backup.json");
+        std::fs::write(&backup, "first").unwrap();
+        std::fs::write(&path, "{second").unwrap();
+        ConfigStore::load_or_reset(path.clone(), MemoryVault::new()).unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "first");
+        let stamped = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("settings.invalid.backup-"))
+            })
+            .expect("the second reset should write a timestamped backup");
+        assert_eq!(std::fs::read_to_string(stamped).unwrap(), "{second");
+    }
+
+    #[test]
+    fn newer_settings_schema_still_fails_without_reset() {
+        let path = temp_path("newer-schema");
+        std::fs::write(&path, r#"{"schema_version":99}"#).unwrap();
+        assert!(ConfigStore::load_or_reset(path.clone(), MemoryVault::new()).is_err());
+        assert!(path.exists());
+        assert!(!path.with_file_name("settings.invalid.backup.json").exists());
     }
 
     #[test]
